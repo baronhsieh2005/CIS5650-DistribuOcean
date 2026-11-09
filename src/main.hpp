@@ -20,10 +20,14 @@ GLuint boidVBO_positions = 0;
 GLuint boidVBO_velocities = 0;
 GLuint boidVBO_cameras = 0;
 GLuint boidIBO = 0;
+GLuint cameraIconVAO = 0;
+GLuint cameraIconVBO_positions = 0;
+GLuint cameraIconVBO_colors = 0;
 GLuint displayImage;
 GLuint program[2];
 
 const unsigned int PROG_BOID = 0;
+const unsigned int PROG_CAMERA_ICON = 1;
 
 const float fovy = (float) (PI / 4);
 const float zNear = 0.10f;

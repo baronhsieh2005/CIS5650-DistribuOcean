@@ -146,6 +146,9 @@ void initVAO() {
   glGenBuffers(1, &boidVBO_velocities);
   glGenBuffers(1, &boidVBO_cameras);
   glGenBuffers(1, &boidIBO);
+  glGenVertexArrays(1, &cameraIconVAO);
+  glGenBuffers(1, &cameraIconVBO_positions);
+  glGenBuffers(1, &cameraIconVBO_colors);
 
   glBindVertexArray(boidVAO);
 
@@ -169,6 +172,17 @@ void initVAO() {
   glBufferData(GL_SHADER_STORAGE_BUFFER, 0, nullptr, GL_DYNAMIC_DRAW);
   glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, boidVBO_cameras);
 
+  glBindVertexArray(cameraIconVAO);
+  glBindBuffer(GL_ARRAY_BUFFER, cameraIconVBO_positions);
+  glBufferData(GL_ARRAY_BUFFER, 0, nullptr, GL_DYNAMIC_DRAW);
+  glEnableVertexAttribArray(positionLocation);
+  glVertexAttribPointer(positionLocation, 4, GL_FLOAT, GL_FALSE, 0, nullptr);
+
+  glBindBuffer(GL_ARRAY_BUFFER, cameraIconVBO_colors);
+  glBufferData(GL_ARRAY_BUFFER, 0, nullptr, GL_DYNAMIC_DRAW);
+  glEnableVertexAttribArray(velocitiesLocation);
+  glVertexAttribPointer(velocitiesLocation, 4, GL_FLOAT, GL_FALSE, 0, nullptr);
+
   glBindVertexArray(0);
 }
 
@@ -179,7 +193,9 @@ void initShaders(GLuint * program) {
     "shaders/boid.vert.glsl",
     "shaders/boid.geom.glsl",
     "shaders/boid.frag.glsl", attributeLocations, 2);
-    glUseProgram(program[PROG_BOID]);
+  program[PROG_CAMERA_ICON] = glslUtility::createProgram(
+    "shaders/camera_icon.vert.glsl",
+    "shaders/camera_icon.frag.glsl", attributeLocations, 2);
 
   }
 
@@ -241,8 +257,14 @@ void initShaders(GLuint * program) {
       glUseProgram(program[PROG_BOID]);
       glBindVertexArray(boidVAO);
       glPointSize((GLfloat)pointSize);
-      glDrawElements(GL_POINTS, N_FOR_VIS + 1, GL_UNSIGNED_INT, 0);
+      glDrawElements(GL_POINTS, N_FOR_VIS, GL_UNSIGNED_INT, 0);
       glPointSize(1.0f);
+
+      glUseProgram(program[PROG_CAMERA_ICON]);
+      glBindVertexArray(cameraIconVAO);
+      glLineWidth(3.0f);
+      glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(cameras.size() * 2));
+      glLineWidth(1.0f);
 
       glUseProgram(0);
       glBindVertexArray(0);
@@ -267,6 +289,19 @@ void initShaders(GLuint * program) {
       currCamera = (currCamera + 1) % static_cast<int>(cameras.size());
       updateCamera();
     }
+    if (action == GLFW_PRESS || action == GLFW_REPEAT) {
+      constexpr float moveStep = 0.25f;
+      if (key == GLFW_KEY_W) cameras[currCamera].move(moveStep, 0.0f, 0.0f);
+      if (key == GLFW_KEY_S) cameras[currCamera].move(-moveStep, 0.0f, 0.0f);
+      if (key == GLFW_KEY_A) cameras[currCamera].move(0.0f, -moveStep, 0.0f);
+      if (key == GLFW_KEY_D) cameras[currCamera].move(0.0f, moveStep, 0.0f);
+      if (key == GLFW_KEY_Q) cameras[currCamera].move(0.0f, 0.0f, -moveStep);
+      if (key == GLFW_KEY_E) cameras[currCamera].move(0.0f, 0.0f, moveStep);
+      if (key == GLFW_KEY_W || key == GLFW_KEY_S || key == GLFW_KEY_A ||
+          key == GLFW_KEY_D || key == GLFW_KEY_Q || key == GLFW_KEY_E) {
+        updateCamera();
+      }
+    }
   }
 
   void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
@@ -276,11 +311,7 @@ void initShaders(GLuint * program) {
 
   void mousePositionCallback(GLFWwindow* window, double xpos, double ypos) {
     if (leftMousePressed) {
-      cameras[currCamera].orbit((xpos - lastX) / width, -(ypos - lastY) / height);
-      updateCamera();
-    }
-    else if (rightMousePressed) {
-      cameras[currCamera].changeZoom((ypos - lastY) / height);
+      cameras[currCamera].rotate((xpos - lastX) / width, -(ypos - lastY) / height);
       updateCamera();
     }
 
@@ -290,10 +321,21 @@ void initShaders(GLuint * program) {
 
   void updateCamera() {
     std::vector<glm::mat4> cameraMatrices(cameras.size());
+    std::vector<glm::vec4> cameraIconPositions;
+    std::vector<glm::vec4> cameraIconColors;
+    cameraIconPositions.reserve(cameras.size() * 2);
+    cameraIconColors.reserve(cameras.size() * 2);
     const float aspectRatio = static_cast<float>(width) / static_cast<float>(height);
     for (std::size_t i = 0; i < cameras.size(); ++i) {
       cameras[i].update(aspectRatio);
       cameraMatrices[i] = cameras[i].getProjMat();
+
+      const glm::vec3 position = cameras[i].getPosition();
+      const glm::vec3 tip = position + cameras[i].getForward() * 0.4f;
+      cameraIconPositions.emplace_back(position, 1.0f);
+      cameraIconPositions.emplace_back(tip, 1.0f);
+      cameraIconColors.emplace_back(1.0f, 0.85f, 0.0f, 1.0f);
+      cameraIconColors.emplace_back(1.0f, 0.85f, 0.0f, 1.0f);
     }
 
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, boidVBO_cameras);
@@ -301,10 +343,19 @@ void initShaders(GLuint * program) {
                  cameraMatrices.data(), GL_DYNAMIC_DRAW);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, boidVBO_cameras);
 
-    glUseProgram(program[PROG_BOID]);
-    const GLint location = glGetUniformLocation(program[PROG_BOID], "currCamera");
-    if (location != -1) {
-      glUniform1i(location, currCamera);
+    glBindBuffer(GL_ARRAY_BUFFER, cameraIconVBO_positions);
+    glBufferData(GL_ARRAY_BUFFER, cameraIconPositions.size() * sizeof(glm::vec4),
+                 cameraIconPositions.data(), GL_DYNAMIC_DRAW);
+    glBindBuffer(GL_ARRAY_BUFFER, cameraIconVBO_colors);
+    glBufferData(GL_ARRAY_BUFFER, cameraIconColors.size() * sizeof(glm::vec4),
+                 cameraIconColors.data(), GL_DYNAMIC_DRAW);
+
+    for (GLuint shaderProgram : program) {
+      glUseProgram(shaderProgram);
+      const GLint location = glGetUniformLocation(shaderProgram, "currCamera");
+      if (location != -1) {
+        glUniform1i(location, currCamera);
+      }
     }
     glUseProgram(0);
   }
