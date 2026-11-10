@@ -46,18 +46,24 @@ void checkCUDAError(const char *msg, int line = -1) {
 /*! Block size used for CUDA kernel launch. */
 #define blockSize 128
 
-#define rule1Distance 5.0f
-#define rule2Distance 3.0f
-#define rule3Distance 5.0f
+#define rule1Distance 15.0f
+#define rule2Distance 9.0f
+#define rule3Distance 15.0f
 
 #define rule1Scale 0.01f
 #define rule2Scale 0.1f
 #define rule3Scale 0.1f
 
-#define maxSpeed 1.0f
+#define maxSpeed 3.0f
 
 /*! Size of the starting area in simulation space. */
-#define scene_scale 100.0f
+#define scene_scale 300.0f
+
+#define cullDistance 240.0f
+#define cullDistanceTolerance 36.0f
+#define cullFrustumTolerance 0.12f
+
+#define spawnFlockRadius 90.0f
 
 /***********************************************
 * Kernel state (pointers are device pointers) *
@@ -91,6 +97,27 @@ glm::vec3 gridMinimum;
 * initSimulation *
 ******************/
 
+__device__ bool shouldBoidSurviveNaive(
+  int i,
+  const glm::vec3 *pos,
+  const glm::vec3 &cameraPosition,
+  const glm::mat4 &projMat) {
+  const glm::vec3 offset = pos[i] - cameraPosition;
+  if (glm::length(offset) > cullDistance + cullDistanceTolerance) {
+    return false;
+  }
+
+  const glm::vec4 clipPosition = projMat * glm::vec4(pos[i], 1.0f);
+  if (clipPosition.w <= 0.0f) {
+    return false;
+  }
+
+  const float clipLimit = clipPosition.w * (1.0f + cullFrustumTolerance);
+  return clipPosition.x >= -clipLimit && clipPosition.x <= clipLimit &&
+         clipPosition.y >= -clipLimit && clipPosition.y <= clipLimit &&
+         clipPosition.z >= -clipLimit && clipPosition.z <= clipLimit;
+}
+
 __host__ __device__ unsigned int hash(unsigned int a) {
   a = (a + 0x7ed55d16) + (a << 12);
   a = (a ^ 0xc761c23c) ^ (a >> 19);
@@ -116,6 +143,22 @@ __global__ void kernGenerateRandomPosArray(int time, int N, glm::vec3 * arr, flo
     arr[index].y = scale * rand.y;
     arr[index].z = scale * rand.z;
   }
+}
+
+__global__ void kernGenerateFlockPositions(int time, int N, glm::vec3 *pos) {
+  int index = (blockIdx.x * blockDim.x) + threadIdx.x;
+  if (index >= N) {
+    return;
+  }
+
+  glm::vec3 flockCenter;
+  switch (index % 3) {
+    case 0: flockCenter = glm::vec3(-75.0f, -30.0f, 0.0f); break;
+    case 1: flockCenter = glm::vec3(75.0f, -30.0f, 0.0f); break;
+    default: flockCenter = glm::vec3(0.0f, 75.0f, 0.0f); break;
+  }
+
+  pos[index] = flockCenter + generateRandomVec3(time, index) * spawnFlockRadius;
 }
 
 /**
@@ -148,9 +191,8 @@ void Boids::initSimulation(int N) {
   cudaMemset(dev_vel2, 0, N * sizeof(glm::vec3));
   checkCUDAErrorWithLine("cudaMemset dev_vel2 failed!");
 
-  kernGenerateRandomPosArray<<<fullBlocksPerGrid, blockSize>>>(1, numObjects,
-    dev_pos, scene_scale);
-  checkCUDAErrorWithLine("kernGenerateRandomPosArray failed!");
+  kernGenerateFlockPositions<<<fullBlocksPerGrid, blockSize>>>(1, numObjects, dev_pos);
+  checkCUDAErrorWithLine("kernGenerateFlockPositions failed!");
 
   gridCellWidth = 2.0f * std::max(std::max(rule1Distance, rule2Distance), rule3Distance);
   int halfSideCount = (int)(scene_scale / gridCellWidth) + 1;
@@ -198,7 +240,7 @@ void Boids::initSimulation(int N) {
 __global__ void kernCopyPositionsToVBO(int N, glm::vec3 *pos, float *vbo, float s_scale) {
   int index = threadIdx.x + (blockIdx.x * blockDim.x);
 
-  float c_scale = -1.0f / s_scale;
+  float c_scale = 1.0f;
 
   if (index < N) {
     vbo[4 * index + 0] = pos[index].x * c_scale;
@@ -475,6 +517,12 @@ void Boids::stepSimulationCoherentGrid(float dt) {
 
     kernUpdatePos<<<fullBlocksPerGrid, blockSize>>>(numObjects, dt, dev_pos, dev_vel1);
     checkCUDAErrorWithLine("kernUpdatePos failed!");
+
+    // kernComputeFlocks<<<fullBlocksPerGrid, blockSize>>>();
+    // checkCUDAErrorWithLine("kernComputeFlocks failed!");
+
+    // kernComputeCameraCulling<<<fullBlocksPerGrid, blockSize>>>();
+    // checkCUDAErrorWithLine("kernComputeCameraCulling failed!");
 
     cudaDeviceSynchronize();
 }

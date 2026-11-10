@@ -3,6 +3,7 @@
 #include "glslUtility.hpp"
 #include "utilityCore.hpp"
 #include "camera.hpp"
+#include "globalCamera.hpp"
 #include <vector>
 #include <glm/glm.hpp>
 #include <GLFW/glfw3.h>
@@ -28,6 +29,8 @@ GLuint program[2];
 
 const unsigned int PROG_BOID = 0;
 const unsigned int PROG_CAMERA_ICON = 1;
+const unsigned int cameraIconVerticesPerCamera = 16;
+GLsizei cameraIconVertexCount = 0;
 
 const float fovy = (float) (PI / 4);
 const float zNear = 0.10f;
@@ -41,11 +44,13 @@ bool leftMousePressed = false;
 bool rightMousePressed = false;
 
 int currCamera = 0;
+bool useGlobalCamera = false;
 std::vector<Camera> cameras = {
-    Camera(-0.70f, 1.22f, 4.0f),
-    Camera(0.70f, 1.10f, 4.5f),
-    Camera(2.10f, 1.45f, 5.0f),
+    Camera(-0.70f, 1.22f, 45.0f, glm::vec3(-75.0f, -30.0f, 0.0f)),
+    Camera(0.70f, 1.10f, 45.0f, glm::vec3(75.0f, -30.0f, 0.0f)),
+    Camera(2.10f, 1.45f, 45.0f, glm::vec3(0.0f, 75.0f, 0.0f)),
 };
+GlobalCamera globalCamera;
 double lastX = 0.0;
 double lastY = 0.0;
 

@@ -61,6 +61,7 @@ set(headers
 set(sources
     src/glslUtility.cpp
     src/camera.cpp
+    src/globalCamera.cpp
     src/kernel.cu
     src/main.cpp
     src/utilityCore.cpp

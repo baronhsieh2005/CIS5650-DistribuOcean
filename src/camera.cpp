@@ -1,5 +1,6 @@
 #include "camera.hpp"
 
+#include <algorithm>
 #include <cmath>
 
 #include <glm/gtc/matrix_transform.hpp>
@@ -7,7 +8,7 @@
 namespace {
 constexpr float kFovy = 3.14159265358979323846f / 4.0f;
 constexpr float kNearPlane = 0.10f;
-constexpr float kFarPlane = 10.0f;
+constexpr float kFarPlane = 160.0f;
 }
 
 Camera::Camera(float phi, float theta, float zoom, glm::vec3 lookAt)
@@ -58,3 +59,4 @@ const glm::vec3& Camera::getPosition() const {
 glm::vec3 Camera::getForward() const {
   return glm::normalize(lookAt - position);
 }
+

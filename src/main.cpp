@@ -22,7 +22,7 @@
 // ================
 
 
-const int N_FOR_VIS = 7500;
+const int N_FOR_VIS = 50000;
 const float DT = 0.2f;
 #define VISUALIZE 1
 
@@ -263,7 +263,7 @@ void initShaders(GLuint * program) {
       glUseProgram(program[PROG_CAMERA_ICON]);
       glBindVertexArray(cameraIconVAO);
       glLineWidth(3.0f);
-      glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(cameras.size() * 2));
+      glDrawArrays(GL_LINES, 0, cameraIconVertexCount);
       glLineWidth(1.0f);
 
       glUseProgram(0);
@@ -286,10 +286,15 @@ void initShaders(GLuint * program) {
       glfwSetWindowShouldClose(window, GL_TRUE);
     }
     if (key == GLFW_KEY_F && action == GLFW_PRESS) {
+      useGlobalCamera = false;
       currCamera = (currCamera + 1) % static_cast<int>(cameras.size());
       updateCamera();
     }
-    if (action == GLFW_PRESS || action == GLFW_REPEAT) {
+    if (key == GLFW_KEY_G && action == GLFW_PRESS) {
+      useGlobalCamera = !useGlobalCamera;
+      updateCamera();
+    }
+    if (!useGlobalCamera && (action == GLFW_PRESS || action == GLFW_REPEAT)) {
       constexpr float moveStep = 0.25f;
       if (key == GLFW_KEY_W) cameras[currCamera].move(moveStep, 0.0f, 0.0f);
       if (key == GLFW_KEY_S) cameras[currCamera].move(-moveStep, 0.0f, 0.0f);
@@ -311,7 +316,14 @@ void initShaders(GLuint * program) {
 
   void mousePositionCallback(GLFWwindow* window, double xpos, double ypos) {
     if (leftMousePressed) {
-      cameras[currCamera].rotate((xpos - lastX) / width, -(ypos - lastY) / height);
+      if (useGlobalCamera) {
+        globalCamera.orbit((xpos - lastX) / width, -(ypos - lastY) / height);
+      } else {
+        cameras[currCamera].rotate((xpos - lastX) / width, -(ypos - lastY) / height);
+      }
+      updateCamera();
+    } else if (rightMousePressed && useGlobalCamera) {
+      globalCamera.changeZoom((ypos - lastY) / height * 100.0f);
       updateCamera();
     }
 
@@ -320,23 +332,49 @@ void initShaders(GLuint * program) {
   }
 
   void updateCamera() {
-    std::vector<glm::mat4> cameraMatrices(cameras.size());
+    std::vector<glm::mat4> cameraMatrices(cameras.size() + 1);
     std::vector<glm::vec4> cameraIconPositions;
     std::vector<glm::vec4> cameraIconColors;
-    cameraIconPositions.reserve(cameras.size() * 2);
-    cameraIconColors.reserve(cameras.size() * 2);
+    cameraIconPositions.reserve(cameras.size() * cameraIconVerticesPerCamera);
+    cameraIconColors.reserve(cameras.size() * cameraIconVerticesPerCamera);
     const float aspectRatio = static_cast<float>(width) / static_cast<float>(height);
     for (std::size_t i = 0; i < cameras.size(); ++i) {
       cameras[i].update(aspectRatio);
       cameraMatrices[i] = cameras[i].getProjMat();
 
+      if (!useGlobalCamera && static_cast<int>(i) == currCamera) {
+        continue;
+      }
+
       const glm::vec3 position = cameras[i].getPosition();
-      const glm::vec3 tip = position + cameras[i].getForward() * 0.4f;
-      cameraIconPositions.emplace_back(position, 1.0f);
-      cameraIconPositions.emplace_back(tip, 1.0f);
-      cameraIconColors.emplace_back(1.0f, 0.85f, 0.0f, 1.0f);
-      cameraIconColors.emplace_back(1.0f, 0.85f, 0.0f, 1.0f);
+      const glm::vec3 forward = cameras[i].getForward();
+      const glm::vec3 right = glm::normalize(glm::cross(forward, glm::vec3(0.0f, 0.0f, 1.0f)));
+      const glm::vec3 up = glm::normalize(glm::cross(right, forward));
+      const glm::vec3 tip = position + forward * 8.0f;
+      const glm::vec3 topLeft = position - right * 4.0f + up * 3.0f;
+      const glm::vec3 topRight = position + right * 4.0f + up * 3.0f;
+      const glm::vec3 bottomRight = position + right * 4.0f - up * 3.0f;
+      const glm::vec3 bottomLeft = position - right * 4.0f - up * 3.0f;
+      const glm::vec4 iconColor(1.0f, 0.0f, 1.0f, 1.0f);
+      const auto addIconEdge = [&](const glm::vec3& start, const glm::vec3& end) {
+        cameraIconPositions.emplace_back(start, 1.0f);
+        cameraIconPositions.emplace_back(end, 1.0f);
+        cameraIconColors.push_back(iconColor);
+        cameraIconColors.push_back(iconColor);
+      };
+
+      addIconEdge(topLeft, topRight);
+      addIconEdge(topRight, bottomRight);
+      addIconEdge(bottomRight, bottomLeft);
+      addIconEdge(bottomLeft, topLeft);
+      addIconEdge(topLeft, tip);
+      addIconEdge(topRight, tip);
+      addIconEdge(bottomRight, tip);
+      addIconEdge(bottomLeft, tip);
     }
+    cameraIconVertexCount = static_cast<GLsizei>(cameraIconPositions.size());
+    globalCamera.update(aspectRatio);
+    cameraMatrices[cameras.size()] = globalCamera.getProjMat();
 
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, boidVBO_cameras);
     glBufferData(GL_SHADER_STORAGE_BUFFER, cameraMatrices.size() * sizeof(glm::mat4),
@@ -350,11 +388,12 @@ void initShaders(GLuint * program) {
     glBufferData(GL_ARRAY_BUFFER, cameraIconColors.size() * sizeof(glm::vec4),
                  cameraIconColors.data(), GL_DYNAMIC_DRAW);
 
+    const int activeCameraIndex = useGlobalCamera ? static_cast<int>(cameras.size()) : currCamera;
     for (GLuint shaderProgram : program) {
       glUseProgram(shaderProgram);
       const GLint location = glGetUniformLocation(shaderProgram, "currCamera");
       if (location != -1) {
-        glUniform1i(location, currCamera);
+        glUniform1i(location, activeCameraIndex);
       }
     }
     glUseProgram(0);
