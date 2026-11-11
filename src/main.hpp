@@ -1,6 +1,7 @@
 #pragma once
 
 #include "glslUtility.hpp"
+#include "kernel.h"
 #include "utilityCore.hpp"
 #include "camera.hpp"
 #include "globalCamera.hpp"
@@ -50,6 +51,7 @@ std::vector<Camera> cameras = {
     Camera(0.70f, 1.10f, 45.0f, glm::vec3(75.0f, -30.0f, 0.0f)),
     Camera(2.10f, 1.45f, 45.0f, glm::vec3(0.0f, 75.0f, 0.0f)),
 };
+std::vector<Boids::CameraCullData> networkCameras;
 GlobalCamera globalCamera;
 double lastX = 0.0;
 double lastY = 0.0;

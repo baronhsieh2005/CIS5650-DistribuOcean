@@ -22,9 +22,11 @@
 // ================
 
 
-const int N_FOR_VIS = 50000;
+const int N_FOR_VIS = 30000;
 const float DT = 0.2f;
 #define VISUALIZE 1
+const double FLOCK_UPDATE_INTERVAL_SECONDS = 1.0 / 20.0;
+const float NETWORK_CULL_DISTANCE = 240.0f;
 
 /**
 * C main function.
@@ -115,6 +117,8 @@ bool init(int argc, char **argv) {
 
   // Initialize N-body simulation
   Boids::initSimulation(N_FOR_VIS);
+  networkCameras.resize(cameras.size());
+  Boids::initializeNetworkPhones(static_cast<uint32_t>(networkCameras.size()));
 
   initShaders(program);
   updateCamera();
@@ -215,6 +219,21 @@ void initShaders(GLuint * program) {
     cudaGLMapBufferObject((void**)&dptrVertVelocities, boidVBO_velocities);
 
     Boids::stepSimulationCoherentGrid(DT);
+
+    static double lastFlockUpdateTime = -FLOCK_UPDATE_INTERVAL_SECONDS;
+    const double currentTime = glfwGetTime();
+    if (currentTime - lastFlockUpdateTime >= FLOCK_UPDATE_INTERVAL_SECONDS) {
+      for (std::size_t cameraIndex = 0; cameraIndex < cameras.size(); ++cameraIndex) {
+        networkCameras[cameraIndex] = {
+          cameras[cameraIndex].getPosition(),
+          NETWORK_CULL_DISTANCE,
+          cameras[cameraIndex].getProjMat(),
+        };
+      }
+      Boids::createNetworkPackets(networkCameras.data(),
+        static_cast<uint32_t>(networkCameras.size()));
+      lastFlockUpdateTime = currentTime;
+    }
 
     #if VISUALIZE
     Boids::copyBoidsToVBO(dptrVertPositions, dptrVertVelocities);
