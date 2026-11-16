@@ -1,6 +1,7 @@
 #define GLM_FORCE_CUDA
 
 #include <cuda.h>
+#include <math_constants.h>
 #include "kernel.h"
 #include "utilityCore.hpp"
 
@@ -11,8 +12,9 @@
 #include <thrust/sort.h>
 #include <thrust/gather.h>
 #include <thrust/device_ptr.h>
+#include <thrust/iterator/counting_iterator.h>
 #include <thrust/random.h>
-#include <thrust/scan.h>
+#include <cub/cub.cuh>
 
 #include <glm/glm.hpp>
 
@@ -60,20 +62,32 @@ void checkCUDAError(const char *msg, int line = -1) {
 
 /*! Size of the starting area in simulation space. */
 #define scene_scale 300.0f
+#define spawnFlockRadius 90.0f
 
-#define cullDistance 240.0f
 #define cullDistanceTolerance 36.0f
 #define cullFrustumTolerance 0.12f
 
-#define spawnFlockRadius 90.0f
+#define MAX_BOIDS_PER_PHONE 20000
 
-#define flockMaxRadius rule1Distance
-#define flockMaxAxisDeviationDegrees 15.0f
-#define flockYawBins 24
-#define flockPitchBins 12
-#define flockDirectionBinCount (flockYawBins * flockPitchBins)
-#define flockDirectionKeyBits 9
-#define flockDirectionKeyMask ((1 << flockDirectionKeyBits) - 1)
+#define DIST_VIEW 0
+#define DIST_SPHERE 1
+#define MIXED 2
+
+#ifndef CULL_TYPE
+#define CULL_TYPE DIST_VIEW
+#endif
+
+// MIXED keeps every nearby boid while a camera turns, then uses a slightly
+// expanded frustum for the remainder of the camera's distance range.
+#define mixedCullSphereFraction 0.5f
+
+// Each signed 16-bit position-delta component represents 1/1024 simulation units.
+// The encodable displacement range per packet is approximately [-32, 32] units.
+#define networkPositionDeltaScale (1.0f / 1024.0f)
+#define networkPositionDepthMaxDistance (Boids::cullDistance + cullDistanceTolerance)
+
+// All three uint16_t components set to this value denote a free/deleted slot.
+#define networkUpdateFreeComponent 0xFFFFu
 
 /***********************************************
 * Kernel state (pointers are device pointers) *
@@ -84,6 +98,8 @@ glm::vec3 *dev_pos;
 glm::vec3 *dev_pos2;
 glm::vec3 *dev_vel1;
 glm::vec3 *dev_vel2;
+uint32_t *dev_boidIds;
+uint32_t *dev_boidIds2;
 
 int *dev_particleArrayIndices;
 int *dev_particleGridIndices;
@@ -93,6 +109,8 @@ thrust::device_ptr<glm::vec3> dev_thrust_vel1;
 thrust::device_ptr<glm::vec3> dev_thrust_vel2;
 thrust::device_ptr<glm::vec3> dev_thrust_pos;
 thrust::device_ptr<glm::vec3> dev_thrust_pos2;
+thrust::device_ptr<uint32_t> dev_thrust_boidIds;
+thrust::device_ptr<uint32_t> dev_thrust_boidIds2;
 
 int *dev_gridCellStartIndices;
 int *dev_gridCellEndIndices;
@@ -103,55 +121,45 @@ float gridCellWidth;
 float gridInverseCellWidth;
 glm::vec3 gridMinimum;
 
-float flockCellWidth;
-float flockInverseCellWidth;
-int flockGridSideCount;
-glm::vec3 flockGridMinimum;
-
-uint32_t *dev_flockKeys;
-uint32_t *dev_flockIndices;
-int *dev_flockHeadFlags;
-int *dev_flockGroupIds;
-Boids::Flock *dev_flocks;
-Boids::CompressedBoid *dev_compressedBoids;
-uint32_t *dev_flockCount;
-
 Boids::CameraCullData *dev_networkCameras;
-uint8_t **dev_phonePacketBuffers;
-uint32_t *dev_phonePacketSizes;
+float **dev_phoneDistanceBuffers;
+uint32_t **dev_phoneSortedBoidIndices;
+int32_t *dev_phoneVisibleCounts;
 uint32_t networkPhoneCount = 0;
-size_t phonePacketCapacityBytes = 0;
-std::vector<uint8_t *> hostPhonePacketBuffers;
+std::vector<float *> hostPhoneDistanceBuffers;
+std::vector<uint32_t *> hostPhoneSortedBoidIndices;
 
-thrust::device_ptr<uint32_t> dev_thrust_flockKeys;
-thrust::device_ptr<uint32_t> dev_thrust_flockIndices;
-thrust::device_ptr<int> dev_thrust_flockHeadFlags;
-thrust::device_ptr<int> dev_thrust_flockGroupIds;
+int **dev_boidSlotInPacketByPhone;
+glm::vec3 **dev_clientPositionsByPhone;
+Boids::UpdateBoidData **dev_boidUpdatePackets;
+Boids::NewBoidData **dev_boidNewPackets;
+uint32_t **dev_packetEpochsByPhone;
+uint32_t **dev_boidIdBySlotInPacket;
+uint8_t **dev_freeSlotFlagsByPhone;
+uint8_t **dev_newBoidFlagsByPhone;
+uint32_t **dev_freeSlotsByPhone;
+uint32_t **dev_newRanksByPhone;
+uint32_t *dev_phoneFreeCounts;
+uint32_t *dev_phoneNewCounts;
+uint32_t *dev_phoneUpdatePayloadLengths;
+uint32_t *dev_phoneNewPayloadLengths;
+void *dev_packetCompactionTempStorage;
+size_t packetCompactionTempStorageBytes = 0;
+uint32_t networkEpoch = 0;
+std::vector<int *> hostBoidSlotInPacketByPhone;
+std::vector<glm::vec3 *> hostClientPositionsByPhone;
+std::vector<Boids::UpdateBoidData *> hostBoidUpdatePackets;
+std::vector<Boids::NewBoidData *> hostBoidNewPackets;
+std::vector<uint32_t *> hostPacketEpochsByPhone;
+std::vector<uint32_t *> hostBoidIdBySlotInPacket;
+std::vector<uint8_t *> hostFreeSlotFlagsByPhone;
+std::vector<uint8_t *> hostNewBoidFlagsByPhone;
+std::vector<uint32_t *> hostFreeSlotsByPhone;
+std::vector<uint32_t *> hostNewRanksByPhone;
 
 /******************
 * initSimulation *
 ******************/
-
-__device__ bool shouldBoidSurviveNaive(
-  int i,
-  const glm::vec3 *pos,
-  const glm::vec3 &cameraPosition,
-  const glm::mat4 &projMat) {
-  const glm::vec3 offset = pos[i] - cameraPosition;
-  if (glm::length(offset) > cullDistance + cullDistanceTolerance) {
-    return false;
-  }
-
-  const glm::vec4 clipPosition = projMat * glm::vec4(pos[i], 1.0f);
-  if (clipPosition.w <= 0.0f) {
-    return false;
-  }
-
-  const float clipLimit = clipPosition.w * (1.0f + cullFrustumTolerance);
-  return clipPosition.x >= -clipLimit && clipPosition.x <= clipLimit &&
-         clipPosition.y >= -clipLimit && clipPosition.y <= clipLimit &&
-         clipPosition.z >= -clipLimit && clipPosition.z <= clipLimit;
-}
 
 __host__ __device__ unsigned int hash(unsigned int a) {
   a = (a + 0x7ed55d16) + (a << 12);
@@ -196,171 +204,10 @@ __global__ void kernGenerateFlockPositions(int time, int N, glm::vec3 *pos) {
   pos[index] = flockCenter + generateRandomVec3(time, index) * spawnFlockRadius;
 }
 
-__device__ float wrapAngle(float angle) {
-  constexpr float twoPi = 6.28318530717958647692f;
-  return angle < 0.0f ? angle + twoPi : angle;
-}
-
-__device__ float signedAngleDelta(float angle, float reference) {
-  constexpr float pi = 3.14159265358979323846f;
-  constexpr float twoPi = 6.28318530717958647692f;
-  float delta = angle - reference;
-  if (delta > pi) delta -= twoPi;
-  if (delta < -pi) delta += twoPi;
-  return delta;
-}
-
-__device__ glm::vec3 boidForward(const glm::vec3 &velocity) {
-  float speed = glm::length(velocity);
-  return speed > 0.00001f ? velocity / speed : glm::vec3(0.0f, 1.0f, 0.0f);
-}
-
-__device__ uint32_t directionBin(const glm::vec3 &forward) {
-  constexpr float pi = 3.14159265358979323846f;
-  float yaw = wrapAngle(atan2f(forward.y, forward.x));
-  float pitch = asinf(fminf(1.0f, fmaxf(-1.0f, forward.z)));
-  int yawBin = min(flockYawBins - 1, (int)(yaw * flockYawBins / (2.0f * pi)));
-  int pitchBin = min(flockPitchBins - 1, (int)((pitch + 0.5f * pi) * flockPitchBins / pi));
-  return pitchBin * flockYawBins + yawBin;
-}
-
-__device__ glm::vec3 directionBinCenter(uint32_t bin) {
-  constexpr float pi = 3.14159265358979323846f;
-  int yawBin = bin % flockYawBins;
-  int pitchBin = bin / flockYawBins;
-  float yaw = (yawBin + 0.5f) * (2.0f * pi / flockYawBins);
-  float pitch = (pitchBin + 0.5f) * (pi / flockPitchBins) - 0.5f * pi;
-  float cosPitch = cosf(pitch);
-  return glm::vec3(cosPitch * cosf(yaw), cosPitch * sinf(yaw), sinf(pitch));
-}
-
-__device__ glm::vec3 flockCellCenter(uint32_t cell, int gridSideCount,
-  glm::vec3 gridMinimum, float cellWidth) {
-  int z = cell / (gridSideCount * gridSideCount);
-  int remaining = cell - z * gridSideCount * gridSideCount;
-  int y = remaining / gridSideCount;
-  int x = remaining - y * gridSideCount;
-  return gridMinimum + glm::vec3(
-      (x + 0.5f) * cellWidth,
-      (y + 0.5f) * cellWidth,
-      (z + 0.5f) * cellWidth);
-}
-
-__device__ uint8_t packSignedRotation(float radians) {
-  constexpr float pi = 3.14159265358979323846f;
-  float maxRadians = flockMaxAxisDeviationDegrees * pi / 180.0f;
-  float clamped = fminf(maxRadians, fmaxf(-maxRadians, radians));
-  uint8_t magnitude = (uint8_t)min(127, (int)roundf(fabsf(clamped) * 127.0f / maxRadians));
-  return (clamped < 0.0f ? 0x80 : 0x00) | magnitude;
-}
-
-__global__ void kernComputeFlockKeys(int N, const glm::vec3 *pos, const glm::vec3 *vel,
-  int gridSideCount, glm::vec3 gridMinimum, float inverseCellWidth,
-  uint32_t *keys, uint32_t *indices) {
-  int index = threadIdx.x + blockIdx.x * blockDim.x;
-  if (index >= N) {
-    return;
-  }
-
-  glm::vec3 boidPos = pos[index];
-  int x = imin(imax((int)floorf((boidPos.x - gridMinimum.x) * inverseCellWidth), 0), gridSideCount - 1);
-  int y = imin(imax((int)floorf((boidPos.y - gridMinimum.y) * inverseCellWidth), 0), gridSideCount - 1);
-  int z = imin(imax((int)floorf((boidPos.z - gridMinimum.z) * inverseCellWidth), 0), gridSideCount - 1);
-  uint32_t cell = x + y * gridSideCount + z * gridSideCount * gridSideCount;
-
-  keys[index] = (cell << flockDirectionKeyBits) | directionBin(boidForward(vel[index]));
-  indices[index] = index;
-}
-
-__global__ void kernMarkFlockHeads(int N, const uint32_t *keys, int *headFlags) {
-  int index = threadIdx.x + blockIdx.x * blockDim.x;
+__global__ void kernInitializeBoidIds(int N, uint32_t *boidIds) {
+  const int index = threadIdx.x + blockIdx.x * blockDim.x;
   if (index < N) {
-    headFlags[index] = index == 0 || keys[index] != keys[index - 1];
-  }
-}
-
-__global__ void kernBuildFlocksAndCompress(int N, const glm::vec3 *pos, const glm::vec3 *vel,
-  const uint32_t *keys, const uint32_t *indices, const int *headFlags, const int *groupIds,
-  int gridSideCount, glm::vec3 gridMinimum, float cellWidth,
-  Boids::Flock *flocks, Boids::CompressedBoid *compressedBoids, uint32_t *flockCount) {
-  int start = threadIdx.x + blockIdx.x * blockDim.x;
-  if (start >= N || !headFlags[start]) {
-    return;
-  }
-
-  int end = start + 1;
-  while (end < N && keys[end] == keys[start]) {
-    end++;
-  }
-
-  glm::vec3 sumPosition(0.0f);
-  glm::vec3 sumForward(0.0f);
-  for (int sortedIndex = start; sortedIndex < end; sortedIndex++) {
-    uint32_t boidIndex = indices[sortedIndex];
-    sumPosition += pos[boidIndex];
-    sumForward += boidForward(vel[boidIndex]);
-  }
-
-  uint32_t count = end - start;
-  glm::vec3 center = sumPosition / (float)count;
-  glm::vec3 direction = glm::length(sumForward) > 0.00001f
-      ? glm::normalize(sumForward)
-      : directionBinCenter(keys[start] & flockDirectionKeyMask);
-
-  constexpr float pi = 3.14159265358979323846f;
-  float maxRadians = flockMaxAxisDeviationDegrees * pi / 180.0f;
-  float directionYaw = atan2f(direction.y, direction.x);
-  float directionPitch = asinf(fminf(1.0f, fmaxf(-1.0f, direction.z)));
-  float radius = 0.0f;
-  bool valid = true;
-
-  for (int sortedIndex = start; sortedIndex < end; sortedIndex++) {
-    uint32_t boidIndex = indices[sortedIndex];
-    glm::vec3 offset = pos[boidIndex] - center;
-    radius = fmaxf(radius, glm::length(offset));
-    glm::vec3 forward = boidForward(vel[boidIndex]);
-    float yaw = atan2f(forward.y, forward.x);
-    float pitch = asinf(fminf(1.0f, fmaxf(-1.0f, forward.z)));
-    valid = valid && fabsf(signedAngleDelta(yaw, directionYaw)) <= maxRadians &&
-      fabsf(pitch - directionPitch) <= maxRadians;
-  }
-
-  if (!valid || radius > flockMaxRadius) {
-    uint32_t cell = keys[start] >> flockDirectionKeyBits;
-    center = flockCellCenter(cell, gridSideCount, gridMinimum, cellWidth);
-    direction = directionBinCenter(keys[start] & flockDirectionKeyMask);
-    radius = 0.0f;
-    for (int sortedIndex = start; sortedIndex < end; ++sortedIndex) {
-      radius = fmaxf(radius, glm::length(pos[indices[sortedIndex]] - center));
-    }
-  }
-
-  uint32_t flockId = groupIds[start];
-  flocks[flockId] = { center, radius, direction, (uint32_t)start, count };
-  atomicMax(flockCount, flockId + 1);
-
-  directionYaw = atan2f(direction.y, direction.x);
-  directionPitch = asinf(fminf(1.0f, fmaxf(-1.0f, direction.z)));
-  float inverseRadius = radius > 1.0e-5f ? 1.0f / radius : 0.0f;
-
-  for (int sortedIndex = start; sortedIndex < end; ++sortedIndex) {
-    uint32_t boidIndex = indices[sortedIndex];
-    glm::vec3 offset = pos[boidIndex] - center;
-    float distance = glm::length(offset);
-    float azimuth = distance > 1.0e-5f ? wrapAngle(atan2f(offset.y, offset.x)) : 0.0f;
-    float polar = distance > 1.0e-5f ? acosf(fminf(1.0f, fmaxf(-1.0f, offset.z / distance))) : 0.0f;
-    glm::vec3 forward = boidForward(vel[boidIndex]);
-    float yaw = atan2f(forward.y, forward.x);
-    float pitch = asinf(fminf(1.0f, fmaxf(-1.0f, forward.z)));
-
-    Boids::CompressedBoid compressed;
-    compressed.radius = (uint8_t)min(255, (int)roundf(distance * inverseRadius * 255.0f));
-    compressed.azimuth = (uint8_t)min(255, (int)roundf(azimuth * 255.0f / (2.0f * pi)));
-    compressed.polar = (uint8_t)min(255, (int)roundf(polar * 255.0f / pi));
-    compressed.rotationX = packSignedRotation(signedAngleDelta(yaw, directionYaw));
-    compressed.rotationY = packSignedRotation(pitch - directionPitch);
-    compressed.rotationZ = packSignedRotation(0.0f);
-    compressedBoids[sortedIndex] = compressed;
+    boidIds[index] = static_cast<uint32_t>(index);
   }
 }
 
@@ -382,6 +229,13 @@ void Boids::initSimulation(int N) {
 
   cudaMalloc((void**)&dev_vel2, N * sizeof(glm::vec3));
   checkCUDAErrorWithLine("cudaMalloc dev_vel2 failed!");
+
+  cudaMalloc((void**)&dev_boidIds, N * sizeof(uint32_t));
+  checkCUDAErrorWithLine("cudaMalloc dev_boidIds failed!");
+  cudaMalloc((void**)&dev_boidIds2, N * sizeof(uint32_t));
+  checkCUDAErrorWithLine("cudaMalloc dev_boidIds2 failed!");
+  kernInitializeBoidIds<<<fullBlocksPerGrid, blockSize>>>(N, dev_boidIds);
+  checkCUDAErrorWithLine("kernInitializeBoidIds failed!");
 
   // Initialize velocity to random values
   cudaMemset(dev_vel1, 0, N * sizeof(glm::vec3));
@@ -409,11 +263,6 @@ void Boids::initSimulation(int N) {
   gridMinimum.y -= halfGridWidth;
   gridMinimum.z -= halfGridWidth;
 
-  flockCellWidth = 2.0f * flockMaxRadius / 1.73205080757f;
-  flockInverseCellWidth = 1.0f / flockCellWidth;
-  flockGridSideCount = (int)ceilf((2.0f * scene_scale) / flockCellWidth);
-  flockGridMinimum = glm::vec3(-scene_scale);
-
   cudaMalloc((void**)&dev_particleArrayIndices, numObjects * sizeof(int));
   checkCUDAErrorWithLine("cudaMalloc dev_particleArrayIndices failed!");
 
@@ -426,27 +275,6 @@ void Boids::initSimulation(int N) {
   cudaMalloc((void**)&dev_gridCellEndIndices, gridCellCount * sizeof(int));
   checkCUDAErrorWithLine("cudaMalloc dev_gridCellEndIndices failed!");
 
-  cudaMalloc((void**)&dev_flockKeys, numObjects * sizeof(uint32_t));
-  checkCUDAErrorWithLine("cudaMalloc dev_flockKeys failed!");
-
-  cudaMalloc((void**)&dev_flockIndices, numObjects * sizeof(uint32_t));
-  checkCUDAErrorWithLine("cudaMalloc dev_flockIndices failed!");
-
-  cudaMalloc((void**)&dev_flockHeadFlags, numObjects * sizeof(int));
-  checkCUDAErrorWithLine("cudaMalloc dev_flockHeadFlags failed!");
-
-  cudaMalloc((void**)&dev_flockGroupIds, numObjects * sizeof(int));
-  checkCUDAErrorWithLine("cudaMalloc dev_flockGroupIds failed!");
-
-  cudaMalloc((void**)&dev_flocks, numObjects * sizeof(Boids::Flock));
-  checkCUDAErrorWithLine("cudaMalloc dev_flocks failed!");
-
-  cudaMalloc((void**)&dev_compressedBoids, numObjects * sizeof(Boids::CompressedBoid));
-  checkCUDAErrorWithLine("cudaMalloc dev_compressedBoids failed!");
-
-  cudaMalloc((void**)&dev_flockCount, sizeof(uint32_t));
-  checkCUDAErrorWithLine("cudaMalloc dev_flockCount failed!");
-
   // needed for use with thrust
   dev_thrust_particleArrayIndices = thrust::device_pointer_cast(dev_particleArrayIndices);
   dev_thrust_particleGridIndices = thrust::device_pointer_cast(dev_particleGridIndices);
@@ -454,10 +282,8 @@ void Boids::initSimulation(int N) {
   dev_thrust_vel2 = thrust::device_pointer_cast(dev_vel2);
   dev_thrust_pos = thrust::device_pointer_cast(dev_pos);
   dev_thrust_pos2 = thrust::device_pointer_cast(dev_pos2);
-  dev_thrust_flockKeys = thrust::device_pointer_cast(dev_flockKeys);
-  dev_thrust_flockIndices = thrust::device_pointer_cast(dev_flockIndices);
-  dev_thrust_flockHeadFlags = thrust::device_pointer_cast(dev_flockHeadFlags);
-  dev_thrust_flockGroupIds = thrust::device_pointer_cast(dev_flockGroupIds);
+  dev_thrust_boidIds = thrust::device_pointer_cast(dev_boidIds);
+  dev_thrust_boidIds2 = thrust::device_pointer_cast(dev_boidIds2);
 
   cudaDeviceSynchronize();
 }
@@ -696,171 +522,644 @@ __global__ void kernUpdateVelNeighborSearchCoherent(
   vel2[boidIndex] = newVel;
 }
 
-void Boids::computeFlocks() {
-  dim3 fullBlocksPerGrid((numObjects + blockSize - 1) / blockSize);
-
-  kernComputeFlockKeys<<<fullBlocksPerGrid, blockSize>>>(numObjects, dev_pos, dev_vel1,
-    flockGridSideCount, flockGridMinimum, flockInverseCellWidth, dev_flockKeys, dev_flockIndices);
-  checkCUDAErrorWithLine("kernComputeFlockKeys failed!");
-
-  thrust::sort_by_key(dev_thrust_flockKeys, dev_thrust_flockKeys + numObjects,
-    dev_thrust_flockIndices);
-
-  kernMarkFlockHeads<<<fullBlocksPerGrid, blockSize>>>(numObjects, dev_flockKeys,
-    dev_flockHeadFlags);
-  checkCUDAErrorWithLine("kernMarkFlockHeads failed!");
-
-  thrust::exclusive_scan(dev_thrust_flockHeadFlags,
-    dev_thrust_flockHeadFlags + numObjects, dev_thrust_flockGroupIds);
-
-  cudaMemset(dev_flockCount, 0, sizeof(uint32_t));
-  kernBuildFlocksAndCompress<<<fullBlocksPerGrid, blockSize>>>(numObjects, dev_pos, dev_vel1,
-    dev_flockKeys, dev_flockIndices, dev_flockHeadFlags, dev_flockGroupIds,
-    flockGridSideCount, flockGridMinimum, flockCellWidth, dev_flocks, dev_compressedBoids,
-    dev_flockCount);
-  checkCUDAErrorWithLine("kernBuildFlocksAndCompress failed!");
-
-  cudaDeviceSynchronize();
-
-  uint32_t flockCount = 0;
-  cudaMemcpy(&flockCount, dev_flockCount, sizeof(uint32_t), cudaMemcpyDeviceToHost);
-  const size_t compressedBytes = flockCount * sizeof(Boids::Flock) +
-    numObjects * sizeof(Boids::CompressedBoid);
-  printf("Flock compression complete: %u flocks, %zu bytes\n", flockCount, compressedBytes);
+const uint32_t* Boids::getDeviceBoidIds() {
+  return dev_boidIds;
 }
 
-const Boids::Flock* Boids::getDeviceFlocks() {
-  return dev_flocks;
-}
-
-const Boids::CompressedBoid* Boids::getDeviceCompressedBoids() {
-  return dev_compressedBoids;
-}
-
-const uint32_t* Boids::getDeviceFlockCount() {
-  return dev_flockCount;
-}
-
-__host__ __device__ uint32_t alignPacketChunk(uint32_t bytes) {
-  return (bytes + 3u) & ~3u;
-}
-
-__device__ bool shouldFlockSurviveNaive(const Boids::Flock &flock,
-  const Boids::CameraCullData &camera) {
-  if (glm::length(flock.position - camera.position) >
-      camera.maxDistance + cullDistanceTolerance + flock.radius) {
-    return false;
-  }
-
-  glm::vec4 clipPosition = camera.projMat * glm::vec4(flock.position, 1.0f);
+__device__ bool isInsideCameraFrustum(const glm::vec3 &position,
+  const Boids::CameraCullData &camera, float tolerance) {
+  const glm::vec4 clipPosition = camera.projMat * glm::vec4(position, 1.0f);
   if (clipPosition.w <= 0.0f) {
     return false;
   }
 
-  float clipLimit = clipPosition.w * (1.0f + cullFrustumTolerance);
+  const float clipLimit = clipPosition.w * (1.0f + tolerance);
   return clipPosition.x >= -clipLimit && clipPosition.x <= clipLimit &&
     clipPosition.y >= -clipLimit && clipPosition.y <= clipLimit &&
     clipPosition.z >= -clipLimit && clipPosition.z <= clipLimit;
 }
 
-__global__ void kernCullFlocksByCameras(uint32_t flockCount,
-  const Boids::Flock *flocks, const Boids::CompressedBoid *compressedBoids,
-  const Boids::CameraCullData *cameras, uint32_t phoneCount,
-  uint8_t **phonePacketBuffers, uint32_t *phonePacketSizes) {
-  uint32_t flockIndex = threadIdx.x + blockIdx.x * blockDim.x;
-  if (flockIndex >= flockCount) {
+__device__ bool shouldBoidSurviveNaive(uint32_t boidIndex,
+  const glm::vec3 *positions, const Boids::CameraCullData &camera,
+  float *distanceToCamera) {
+  const glm::vec3 offset = positions[boidIndex] - camera.position;
+  const float distance = glm::length(offset);
+  *distanceToCamera = distance;
+
+#if CULL_TYPE == DIST_VIEW
+  return distance <= Boids::cullDistance + cullDistanceTolerance &&
+    isInsideCameraFrustum(positions[boidIndex], camera, 0.0f);
+#elif CULL_TYPE == DIST_SPHERE
+  return distance <= Boids::cullDistance + cullDistanceTolerance;
+#elif CULL_TYPE == MIXED
+  if (distance <= Boids::cullDistance * mixedCullSphereFraction) {
+    return true;
+  }
+  return distance <= Boids::cullDistance + cullDistanceTolerance &&
+    isInsideCameraFrustum(positions[boidIndex], camera, cullFrustumTolerance);
+#else
+#error "CULL_TYPE must be DIST_VIEW, DIST_SPHERE, or MIXED"
+#endif
+}
+
+__global__ void kernCullBoidsByCameras(uint32_t boidCount,
+  const glm::vec3 *positions, const Boids::CameraCullData *cameras,
+  uint32_t phoneCount, float **distancesByPhone, uint32_t **sortedBoidIndicesByPhone) {
+  const uint32_t boidIndex = threadIdx.x + blockIdx.x * blockDim.x;
+  if (boidIndex >= boidCount) {
     return;
   }
 
-  const Boids::Flock flock = flocks[flockIndex];
-  const uint32_t payloadBytes = sizeof(Boids::NetworkFlock) +
-    flock.numBoids * sizeof(Boids::CompressedBoid);
-  const uint32_t chunkBytes = alignPacketChunk(payloadBytes);
-
   for (uint32_t phoneIndex = 0; phoneIndex < phoneCount; ++phoneIndex) {
-    if (!shouldFlockSurviveNaive(flock, cameras[phoneIndex])) {
-      continue;
-    }
-
-    const uint32_t packetOffset = atomicAdd(&phonePacketSizes[phoneIndex], chunkBytes);
-    uint8_t *packet = phonePacketBuffers[phoneIndex] + packetOffset;
-    Boids::NetworkFlock *packetFlock = reinterpret_cast<Boids::NetworkFlock *>(packet);
-    *packetFlock = { flock.position, flock.radius, flock.direction, flock.numBoids };
-
-    uint8_t *packetBoids = packet + sizeof(Boids::NetworkFlock);
-    const uint8_t *sourceBoids = reinterpret_cast<const uint8_t *>(
-      compressedBoids + flock.startIndex);
-    for (uint32_t byte = 0; byte < flock.numBoids * sizeof(Boids::CompressedBoid); ++byte) {
-      packetBoids[byte] = sourceBoids[byte];
-    }
+    float distanceToCamera;
+    const bool survives = shouldBoidSurviveNaive(boidIndex, positions,
+      cameras[phoneIndex], &distanceToCamera);
+    distancesByPhone[phoneIndex][boidIndex] = survives ? distanceToCamera : CUDART_INF_F;
+    sortedBoidIndicesByPhone[phoneIndex][boidIndex] = boidIndex;
   }
 }
 
-void Boids::initializeNetworkPhones(uint32_t phoneCount) {
-  for (uint8_t *packetBuffer : hostPhonePacketBuffers) {
-    cudaFree(packetBuffer);
+void Boids::initializeNetworkPhones(const CameraCullData *cameras, uint32_t phoneCount) {
+  for (float *distanceBuffer : hostPhoneDistanceBuffers) {
+    cudaFree(distanceBuffer);
   }
-  hostPhonePacketBuffers.clear();
+  for (uint32_t *sortedIndices : hostPhoneSortedBoidIndices) {
+    cudaFree(sortedIndices);
+  }
+  for (int *slotMap : hostBoidSlotInPacketByPhone) {
+    cudaFree(slotMap);
+  }
+  for (glm::vec3 *clientPositions : hostClientPositionsByPhone) {
+    cudaFree(clientPositions);
+  }
+  for (Boids::UpdateBoidData *updatePacket : hostBoidUpdatePackets) {
+    cudaFree(updatePacket);
+  }
+  for (Boids::NewBoidData *newPacket : hostBoidNewPackets) {
+    cudaFree(newPacket);
+  }
+  for (uint32_t *packetEpochs : hostPacketEpochsByPhone) {
+    cudaFree(packetEpochs);
+  }
+  for (uint32_t *boidIdsBySlot : hostBoidIdBySlotInPacket) {
+    cudaFree(boidIdsBySlot);
+  }
+  for (uint8_t *freeFlags : hostFreeSlotFlagsByPhone) {
+    cudaFree(freeFlags);
+  }
+  for (uint8_t *newFlags : hostNewBoidFlagsByPhone) {
+    cudaFree(newFlags);
+  }
+  for (uint32_t *freeSlots : hostFreeSlotsByPhone) {
+    cudaFree(freeSlots);
+  }
+  for (uint32_t *newRanks : hostNewRanksByPhone) {
+    cudaFree(newRanks);
+  }
+  for (uint32_t *boidIdsBySlot : hostBoidIdBySlotInPacket) {
+    cudaFree(boidIdsBySlot);
+  }
+  for (uint8_t *freeFlags : hostFreeSlotFlagsByPhone) {
+    cudaFree(freeFlags);
+  }
+  for (uint8_t *newFlags : hostNewBoidFlagsByPhone) {
+    cudaFree(newFlags);
+  }
+  for (uint32_t *freeSlots : hostFreeSlotsByPhone) {
+    cudaFree(freeSlots);
+  }
+  for (uint32_t *newRanks : hostNewRanksByPhone) {
+    cudaFree(newRanks);
+  }
+  hostPhoneDistanceBuffers.clear();
+  hostPhoneSortedBoidIndices.clear();
+  hostBoidSlotInPacketByPhone.clear();
+  hostClientPositionsByPhone.clear();
+  hostBoidUpdatePackets.clear();
+  hostBoidNewPackets.clear();
+  hostPacketEpochsByPhone.clear();
+  hostBoidIdBySlotInPacket.clear();
+  hostFreeSlotFlagsByPhone.clear();
+  hostNewBoidFlagsByPhone.clear();
+  hostFreeSlotsByPhone.clear();
+  hostNewRanksByPhone.clear();
   if (dev_networkCameras != nullptr) cudaFree(dev_networkCameras);
-  if (dev_phonePacketBuffers != nullptr) cudaFree(dev_phonePacketBuffers);
-  if (dev_phonePacketSizes != nullptr) cudaFree(dev_phonePacketSizes);
+  if (dev_phoneDistanceBuffers != nullptr) cudaFree(dev_phoneDistanceBuffers);
+  if (dev_phoneSortedBoidIndices != nullptr) cudaFree(dev_phoneSortedBoidIndices);
+  if (dev_phoneVisibleCounts != nullptr) cudaFree(dev_phoneVisibleCounts);
+  if (dev_boidSlotInPacketByPhone != nullptr) cudaFree(dev_boidSlotInPacketByPhone);
+  if (dev_clientPositionsByPhone != nullptr) cudaFree(dev_clientPositionsByPhone);
+  if (dev_boidUpdatePackets != nullptr) cudaFree(dev_boidUpdatePackets);
+  if (dev_boidNewPackets != nullptr) cudaFree(dev_boidNewPackets);
+  if (dev_packetEpochsByPhone != nullptr) cudaFree(dev_packetEpochsByPhone);
+  if (dev_boidIdBySlotInPacket != nullptr) cudaFree(dev_boidIdBySlotInPacket);
+  if (dev_freeSlotFlagsByPhone != nullptr) cudaFree(dev_freeSlotFlagsByPhone);
+  if (dev_newBoidFlagsByPhone != nullptr) cudaFree(dev_newBoidFlagsByPhone);
+  if (dev_freeSlotsByPhone != nullptr) cudaFree(dev_freeSlotsByPhone);
+  if (dev_newRanksByPhone != nullptr) cudaFree(dev_newRanksByPhone);
+  if (dev_phoneFreeCounts != nullptr) cudaFree(dev_phoneFreeCounts);
+  if (dev_phoneNewCounts != nullptr) cudaFree(dev_phoneNewCounts);
+  if (dev_phoneUpdatePayloadLengths != nullptr) cudaFree(dev_phoneUpdatePayloadLengths);
+  if (dev_phoneNewPayloadLengths != nullptr) cudaFree(dev_phoneNewPayloadLengths);
+  if (dev_packetCompactionTempStorage != nullptr) cudaFree(dev_packetCompactionTempStorage);
 
+  dev_networkCameras = nullptr;
+  dev_phoneDistanceBuffers = nullptr;
+  dev_phoneSortedBoidIndices = nullptr;
+  dev_phoneVisibleCounts = nullptr;
+  dev_boidSlotInPacketByPhone = nullptr;
+  dev_clientPositionsByPhone = nullptr;
+  dev_boidUpdatePackets = nullptr;
+  dev_boidNewPackets = nullptr;
+  dev_packetEpochsByPhone = nullptr;
+  dev_boidIdBySlotInPacket = nullptr;
+  dev_freeSlotFlagsByPhone = nullptr;
+  dev_newBoidFlagsByPhone = nullptr;
+  dev_freeSlotsByPhone = nullptr;
+  dev_newRanksByPhone = nullptr;
+  dev_phoneFreeCounts = nullptr;
+  dev_phoneNewCounts = nullptr;
+  dev_phoneUpdatePayloadLengths = nullptr;
+  dev_phoneNewPayloadLengths = nullptr;
+  dev_packetCompactionTempStorage = nullptr;
+  packetCompactionTempStorageBytes = 0;
+  networkEpoch = 0;
   networkPhoneCount = phoneCount;
-  phonePacketCapacityBytes = numObjects * alignPacketChunk(
-    sizeof(Boids::NetworkFlock) + sizeof(Boids::CompressedBoid));
+  if (phoneCount == 0) {
+    return;
+  }
 
-  hostPhonePacketBuffers.resize(phoneCount);
+  hostPhoneDistanceBuffers.resize(phoneCount);
+  hostPhoneSortedBoidIndices.resize(phoneCount);
   for (uint32_t phoneIndex = 0; phoneIndex < phoneCount; ++phoneIndex) {
-    cudaMalloc((void **)&hostPhonePacketBuffers[phoneIndex], phonePacketCapacityBytes);
-    checkCUDAErrorWithLine("cudaMalloc phone packet buffer failed!");
+    cudaMalloc((void **)&hostPhoneDistanceBuffers[phoneIndex], numObjects * sizeof(float));
+    checkCUDAErrorWithLine("cudaMalloc phone distance buffer failed!");
+    cudaMalloc((void **)&hostPhoneSortedBoidIndices[phoneIndex], numObjects * sizeof(uint32_t));
+    checkCUDAErrorWithLine("cudaMalloc phone sorted-index buffer failed!");
   }
 
   cudaMalloc((void **)&dev_networkCameras, phoneCount * sizeof(Boids::CameraCullData));
   checkCUDAErrorWithLine("cudaMalloc network cameras failed!");
-  cudaMalloc((void **)&dev_phonePacketBuffers, phoneCount * sizeof(uint8_t *));
-  checkCUDAErrorWithLine("cudaMalloc phone packet pointer array failed!");
-  cudaMalloc((void **)&dev_phonePacketSizes, phoneCount * sizeof(uint32_t));
-  checkCUDAErrorWithLine("cudaMalloc phone packet size array failed!");
-  cudaMemcpy(dev_phonePacketBuffers, hostPhonePacketBuffers.data(), phoneCount * sizeof(uint8_t *),
+  cudaMemcpy(dev_networkCameras, cameras, phoneCount * sizeof(Boids::CameraCullData),
     cudaMemcpyHostToDevice);
-}
+  checkCUDAErrorWithLine("cudaMemcpy initial network cameras failed!");
+  cudaMalloc((void **)&dev_phoneDistanceBuffers, phoneCount * sizeof(float *));
+  checkCUDAErrorWithLine("cudaMalloc phone distance pointer array failed!");
+  cudaMemcpy(dev_phoneDistanceBuffers, hostPhoneDistanceBuffers.data(),
+    phoneCount * sizeof(float *), cudaMemcpyHostToDevice);
+  checkCUDAErrorWithLine("cudaMemcpy phone distance pointer array failed!");
+  cudaMalloc((void **)&dev_phoneSortedBoidIndices, phoneCount * sizeof(uint32_t *));
+  checkCUDAErrorWithLine("cudaMalloc phone sorted-index pointer array failed!");
+  cudaMemcpy(dev_phoneSortedBoidIndices, hostPhoneSortedBoidIndices.data(),
+    phoneCount * sizeof(uint32_t *), cudaMemcpyHostToDevice);
+  checkCUDAErrorWithLine("cudaMemcpy phone sorted-index pointer array failed!");
+  cudaMalloc((void **)&dev_phoneVisibleCounts, phoneCount * sizeof(int32_t));
+  checkCUDAErrorWithLine("cudaMalloc phone visible count array failed!");
 
-void Boids::createNetworkPackets(const CameraCullData *cameras, uint32_t phoneCount) {
-  if (phoneCount != networkPhoneCount) {
-    initializeNetworkPhones(phoneCount);
+  hostBoidSlotInPacketByPhone.resize(phoneCount);
+  hostClientPositionsByPhone.resize(phoneCount);
+  hostBoidUpdatePackets.resize(phoneCount);
+  hostBoidNewPackets.resize(phoneCount);
+  hostPacketEpochsByPhone.resize(phoneCount);
+  hostBoidIdBySlotInPacket.resize(phoneCount);
+  hostFreeSlotFlagsByPhone.resize(phoneCount);
+  hostNewBoidFlagsByPhone.resize(phoneCount);
+  hostFreeSlotsByPhone.resize(phoneCount);
+  hostNewRanksByPhone.resize(phoneCount);
+  for (uint32_t phoneIndex = 0; phoneIndex < phoneCount; ++phoneIndex) {
+    cudaMalloc((void **)&hostBoidSlotInPacketByPhone[phoneIndex], numObjects * sizeof(int));
+    cudaMemset(hostBoidSlotInPacketByPhone[phoneIndex], 0xFF, numObjects * sizeof(int));
+    cudaMalloc((void **)&hostClientPositionsByPhone[phoneIndex], MAX_BOIDS_PER_PHONE * sizeof(glm::vec3));
+    cudaMemset(hostClientPositionsByPhone[phoneIndex], 0, MAX_BOIDS_PER_PHONE * sizeof(glm::vec3));
+    cudaMalloc((void **)&hostBoidUpdatePackets[phoneIndex],
+      MAX_BOIDS_PER_PHONE * sizeof(Boids::UpdateBoidData));
+    cudaMalloc((void **)&hostBoidNewPackets[phoneIndex],
+      MAX_BOIDS_PER_PHONE * sizeof(Boids::NewBoidData));
+    cudaMalloc((void **)&hostPacketEpochsByPhone[phoneIndex], MAX_BOIDS_PER_PHONE * sizeof(uint32_t));
+    cudaMemset(hostPacketEpochsByPhone[phoneIndex], 0, MAX_BOIDS_PER_PHONE * sizeof(uint32_t));
+    cudaMalloc((void **)&hostBoidIdBySlotInPacket[phoneIndex], MAX_BOIDS_PER_PHONE * sizeof(uint32_t));
+    cudaMemset(hostBoidIdBySlotInPacket[phoneIndex], 0xFF, MAX_BOIDS_PER_PHONE * sizeof(uint32_t));
+    cudaMalloc((void **)&hostFreeSlotFlagsByPhone[phoneIndex], MAX_BOIDS_PER_PHONE * sizeof(uint8_t));
+    cudaMalloc((void **)&hostNewBoidFlagsByPhone[phoneIndex], MAX_BOIDS_PER_PHONE * sizeof(uint8_t));
+    cudaMalloc((void **)&hostFreeSlotsByPhone[phoneIndex], MAX_BOIDS_PER_PHONE * sizeof(uint32_t));
+    cudaMalloc((void **)&hostNewRanksByPhone[phoneIndex], MAX_BOIDS_PER_PHONE * sizeof(uint32_t));
+    checkCUDAErrorWithLine("cudaMalloc network packet state failed!");
   }
 
-  computeFlocks();
+  cudaMalloc((void **)&dev_boidSlotInPacketByPhone, phoneCount * sizeof(int *));
+  cudaMalloc((void **)&dev_clientPositionsByPhone, phoneCount * sizeof(glm::vec3 *));
+  cudaMalloc((void **)&dev_boidUpdatePackets, phoneCount * sizeof(Boids::UpdateBoidData *));
+  cudaMalloc((void **)&dev_boidNewPackets, phoneCount * sizeof(Boids::NewBoidData *));
+  cudaMalloc((void **)&dev_packetEpochsByPhone, phoneCount * sizeof(uint32_t *));
+  cudaMalloc((void **)&dev_boidIdBySlotInPacket, phoneCount * sizeof(uint32_t *));
+  cudaMalloc((void **)&dev_freeSlotFlagsByPhone, phoneCount * sizeof(uint8_t *));
+  cudaMalloc((void **)&dev_newBoidFlagsByPhone, phoneCount * sizeof(uint8_t *));
+  cudaMalloc((void **)&dev_freeSlotsByPhone, phoneCount * sizeof(uint32_t *));
+  cudaMalloc((void **)&dev_newRanksByPhone, phoneCount * sizeof(uint32_t *));
+  cudaMalloc((void **)&dev_phoneFreeCounts, phoneCount * sizeof(uint32_t));
+  cudaMalloc((void **)&dev_phoneNewCounts, phoneCount * sizeof(uint32_t));
+  cudaMalloc((void **)&dev_phoneUpdatePayloadLengths, phoneCount * sizeof(uint32_t));
+  cudaMalloc((void **)&dev_phoneNewPayloadLengths, phoneCount * sizeof(uint32_t));
+  cudaMemcpy(dev_boidSlotInPacketByPhone, hostBoidSlotInPacketByPhone.data(),
+    phoneCount * sizeof(int *), cudaMemcpyHostToDevice);
+  cudaMemcpy(dev_clientPositionsByPhone, hostClientPositionsByPhone.data(),
+    phoneCount * sizeof(glm::vec3 *), cudaMemcpyHostToDevice);
+  cudaMemcpy(dev_boidUpdatePackets, hostBoidUpdatePackets.data(),
+    phoneCount * sizeof(Boids::UpdateBoidData *), cudaMemcpyHostToDevice);
+  cudaMemcpy(dev_boidNewPackets, hostBoidNewPackets.data(),
+    phoneCount * sizeof(Boids::NewBoidData *), cudaMemcpyHostToDevice);
+  cudaMemcpy(dev_packetEpochsByPhone, hostPacketEpochsByPhone.data(),
+    phoneCount * sizeof(uint32_t *), cudaMemcpyHostToDevice);
+  cudaMemcpy(dev_boidIdBySlotInPacket, hostBoidIdBySlotInPacket.data(),
+    phoneCount * sizeof(uint32_t *), cudaMemcpyHostToDevice);
+  cudaMemcpy(dev_freeSlotFlagsByPhone, hostFreeSlotFlagsByPhone.data(),
+    phoneCount * sizeof(uint8_t *), cudaMemcpyHostToDevice);
+  cudaMemcpy(dev_newBoidFlagsByPhone, hostNewBoidFlagsByPhone.data(),
+    phoneCount * sizeof(uint8_t *), cudaMemcpyHostToDevice);
+  cudaMemcpy(dev_freeSlotsByPhone, hostFreeSlotsByPhone.data(),
+    phoneCount * sizeof(uint32_t *), cudaMemcpyHostToDevice);
+  cudaMemcpy(dev_newRanksByPhone, hostNewRanksByPhone.data(),
+    phoneCount * sizeof(uint32_t *), cudaMemcpyHostToDevice);
+  checkCUDAErrorWithLine("cudaMemcpy network packet state pointers failed!");
 
-  uint32_t flockCount = 0;
-  cudaMemcpy(&flockCount, dev_flockCount, sizeof(uint32_t), cudaMemcpyDeviceToHost);
-  cudaMemcpy(dev_networkCameras, cameras, phoneCount * sizeof(CameraCullData), cudaMemcpyHostToDevice);
-  cudaMemset(dev_phonePacketSizes, 0, phoneCount * sizeof(uint32_t));
+  thrust::counting_iterator<uint32_t> slotIndices(0);
+  size_t freeSelectBytes = 0;
+  size_t newSelectBytes = 0;
+  cub::DeviceSelect::Flagged(nullptr, freeSelectBytes, slotIndices,
+    hostFreeSlotFlagsByPhone[0], hostFreeSlotsByPhone[0], dev_phoneFreeCounts,
+    MAX_BOIDS_PER_PHONE);
+  cub::DeviceSelect::Flagged(nullptr, newSelectBytes, slotIndices,
+    hostNewBoidFlagsByPhone[0], hostNewRanksByPhone[0], dev_phoneNewCounts,
+    MAX_BOIDS_PER_PHONE);
+  packetCompactionTempStorageBytes = imax(freeSelectBytes, newSelectBytes);
+  cudaMalloc(&dev_packetCompactionTempStorage, packetCompactionTempStorageBytes);
+  checkCUDAErrorWithLine("cudaMalloc packet compaction storage failed!");
+}
 
-  dim3 blocksPerGrid((flockCount + blockSize - 1) / blockSize);
-  kernCullFlocksByCameras<<<blocksPerGrid, blockSize>>>(flockCount, dev_flocks,
-    dev_compressedBoids, dev_networkCameras, phoneCount, dev_phonePacketBuffers,
-    dev_phonePacketSizes);
-  checkCUDAErrorWithLine("kernCullFlocksByCameras failed!");
+__global__ void kernGetFirstInf(uint32_t boidCount, uint32_t phoneCount,
+  float **distancesByPhone, int32_t *visibleCounts) {
+  const uint32_t boidIndex = threadIdx.x + blockIdx.x * blockDim.x;
+  const uint32_t phoneIndex = threadIdx.y + blockIdx.y * blockDim.y;
+  if (boidIndex >= boidCount || phoneIndex >= phoneCount) {
+    return;
+  }
+
+  const float *distances = distancesByPhone[phoneIndex];
+  const bool currentIsInfinite = distances[boidIndex] == CUDART_INF_F;
+  if (boidIndex == 0 && currentIsInfinite) {
+    visibleCounts[phoneIndex] = -1;
+  } else if (boidIndex == boidCount - 1 && !currentIsInfinite) {
+    visibleCounts[phoneIndex] = imin(static_cast<int>(boidIndex), MAX_BOIDS_PER_PHONE - 1);
+  } else if (!currentIsInfinite && distances[boidIndex + 1] == CUDART_INF_F) {
+    visibleCounts[phoneIndex] = imin(static_cast<int>(boidIndex), MAX_BOIDS_PER_PHONE - 1);
+  }
+}
+
+__device__ int16_t quantizeNetworkDelta(float delta) {
+  const int quantized = static_cast<int>(roundf(delta / networkPositionDeltaScale));
+  return static_cast<int16_t>(imax(-32768, imin(32767, quantized)));
+}
+
+__device__ void markUpdateSlotFree(Boids::UpdateBoidData &update) {
+  update.pos_delta[0] = static_cast<int16_t>(networkUpdateFreeComponent);
+  update.pos_delta[1] = static_cast<int16_t>(networkUpdateFreeComponent);
+  update.pos_delta[2] = static_cast<int16_t>(networkUpdateFreeComponent);
+}
+
+__device__ bool usePolarNewBoidEncoding(const glm::vec3 &position,
+  const Boids::CameraCullData &camera) {
+#if CULL_TYPE == DIST_VIEW
+  return false;
+#elif CULL_TYPE == DIST_SPHERE
+  return true;
+#elif CULL_TYPE == MIXED
+  return !isInsideCameraFrustum(position, camera, 0.0f);
+#endif
+}
+
+__device__ uint8_t quantizeUnitFloat(float value) {
+  return static_cast<uint8_t>(roundf(fminf(1.0f, fmaxf(0.0f, value)) * 255.0f));
+}
+
+__device__ uint16_t quantizeNetworkDepth(float distance) {
+  return static_cast<uint16_t>(roundf(fminf(1.0f,
+    fmaxf(0.0f, distance / networkPositionDepthMaxDistance)) * 65535.0f));
+}
+
+__device__ float dequantizeNetworkDepth(uint16_t depth) {
+  return static_cast<float>(depth) * networkPositionDepthMaxDistance / 65535.0f;
+}
+
+__device__ glm::vec3 encodeNewBoidPosition(Boids::NewBoidData &boidNewData,
+  uint16_t slot, const glm::vec3 &position, const Boids::CameraCullData &camera) {
+  const glm::vec3 offset = position - camera.position;
+  const float distance = glm::length(offset);
+  const uint16_t depth = quantizeNetworkDepth(distance);
+  bool usePolar = usePolarNewBoidEncoding(position, camera);
+
+  if (!usePolar) {
+    const glm::vec4 clipPosition = camera.projMat * glm::vec4(position, 1.0f);
+    if (clipPosition.w > 0.0f) {
+      const float ndcX = clipPosition.x / clipPosition.w;
+      const float ndcY = clipPosition.y / clipPosition.w;
+      const uint8_t encodedX = quantizeUnitFloat(ndcX * 0.5f + 0.5f);
+      const uint8_t encodedY = quantizeUnitFloat(ndcY * 0.5f + 0.5f);
+      boidNewData.new_idx_slot = slot;
+      boidNewData.position.view = { encodedX, encodedY, depth };
+
+      const glm::mat4 inverseProjView = glm::inverse(camera.projMat);
+      const float decodedNdcX = static_cast<float>(encodedX) * 2.0f / 255.0f - 1.0f;
+      const float decodedNdcY = static_cast<float>(encodedY) * 2.0f / 255.0f - 1.0f;
+      glm::vec4 farPoint = inverseProjView * glm::vec4(decodedNdcX, decodedNdcY, 1.0f, 1.0f);
+      farPoint /= farPoint.w;
+      const glm::vec3 ray = glm::normalize(glm::vec3(farPoint) - camera.position);
+      return camera.position + ray * dequantizeNetworkDepth(depth);
+    }
+    usePolar = true;
+  }
+
+  constexpr float pi = 3.14159265358979323846f;
+  constexpr float twoPi = 6.28318530717958647692f;
+  const glm::vec3 direction = distance > 1.0e-5f ? offset / distance : glm::vec3(0.0f, 0.0f, 1.0f);
+  float azimuth = atan2f(direction.y, direction.x);
+  if (azimuth < 0.0f) azimuth += twoPi;
+  const float elevation = asinf(fminf(1.0f, fmaxf(-1.0f, direction.z)));
+  const uint8_t encodedAzimuth = quantizeUnitFloat(azimuth / twoPi);
+  const uint8_t encodedElevation = quantizeUnitFloat(elevation / pi + 0.5f);
+  boidNewData.new_idx_slot = slot | Boids::NEW_BOID_POLAR_ENCODING_BIT;
+  boidNewData.position.polar = { encodedAzimuth, encodedElevation, depth };
+
+  const float decodedAzimuth = static_cast<float>(encodedAzimuth) * twoPi / 255.0f;
+  const float decodedElevation = static_cast<float>(encodedElevation) * pi / 255.0f - pi * 0.5f;
+  const float cosElevation = cosf(decodedElevation);
+  const glm::vec3 decodedDirection(cosElevation * cosf(decodedAzimuth),
+    cosElevation * sinf(decodedAzimuth), sinf(decodedElevation));
+  return camera.position + decodedDirection * dequantizeNetworkDepth(depth);
+}
+
+__global__ void kernBuildNetworkPackets(uint32_t phoneCount, uint32_t currentEpoch,
+  const glm::vec3 *boidPositions, const uint32_t *boidIds,
+  uint32_t **sortedBoidIndicesByPhone, const int32_t *visibleLastIndices,
+  int **boidSlotInPacketByPhone, glm::vec3 **clientPositionsByPhone,
+  Boids::UpdateBoidData **boidUpdatePackets, Boids::NewBoidData **boidNewPackets,
+  uint32_t **packetEpochsByPhone, uint8_t **newBoidFlagsByPhone) {
+  const uint32_t linearIndex = threadIdx.x + blockIdx.x * blockDim.x;
+  const uint32_t phoneIndex = linearIndex / MAX_BOIDS_PER_PHONE;
+  const uint32_t selectedRank = linearIndex % MAX_BOIDS_PER_PHONE;
+  if (phoneIndex >= phoneCount) {
+    return;
+  }
+  const int32_t visibleLastIndex = visibleLastIndices[phoneIndex];
+  if (visibleLastIndex < 0 || selectedRank > static_cast<uint32_t>(visibleLastIndex)) {
+    newBoidFlagsByPhone[phoneIndex][selectedRank] = 0;
+    return;
+  }
+
+  const uint32_t currentBoidIndex = sortedBoidIndicesByPhone[phoneIndex][selectedRank];
+  const uint32_t stableBoidId = boidIds[currentBoidIndex];
+  const int slotInPacket = boidSlotInPacketByPhone[phoneIndex][stableBoidId];
+  if (slotInPacket > -1) {
+    newBoidFlagsByPhone[phoneIndex][selectedRank] = 0;
+    // Existing boid: encode current position relative to the client's estimate.
+    glm::vec3 &clientPosition = clientPositionsByPhone[phoneIndex][slotInPacket];
+    const glm::vec3 delta = boidPositions[currentBoidIndex] - clientPosition;
+    int16_t deltaX = quantizeNetworkDelta(delta.x);
+    int16_t deltaY = quantizeNetworkDelta(delta.y);
+    int16_t deltaZ = quantizeNetworkDelta(delta.z);
+    if (deltaX == -1 && deltaY == -1 && deltaZ == -1) {
+      deltaZ = -2;
+    }
+
+    Boids::UpdateBoidData &boidUpdatePacketData = boidUpdatePackets[phoneIndex][slotInPacket];
+    boidUpdatePacketData.pos_delta[0] = deltaX;
+    boidUpdatePacketData.pos_delta[1] = deltaY;
+    boidUpdatePacketData.pos_delta[2] = deltaZ;
+
+    clientPosition += glm::vec3(deltaX, deltaY, deltaZ) * networkPositionDeltaScale;
+    packetEpochsByPhone[phoneIndex][slotInPacket] = currentEpoch;
+  } else {
+    // Mark if new boid to create later
+    newBoidFlagsByPhone[phoneIndex][selectedRank] = 1;
+  }
+}
+
+__global__ void kernClearFreePacketSlots(uint32_t phoneCount, uint32_t currentEpoch,
+  int **boidSlotInPacketByPhone, uint32_t **boidIdBySlotInPacket,
+  uint32_t **packetEpochsByPhone, Boids::UpdateBoidData **boidUpdatePackets,
+  uint8_t **freeSlotFlagsByPhone) {
+  const uint32_t linearIndex = threadIdx.x + blockIdx.x * blockDim.x;
+  const uint32_t phoneIndex = linearIndex / MAX_BOIDS_PER_PHONE;
+  const uint32_t slot = linearIndex % MAX_BOIDS_PER_PHONE;
+  if (phoneIndex >= phoneCount) {
+    return;
+  }
+
+  uint32_t &epoch = packetEpochsByPhone[phoneIndex][slot];
+  const bool isFree = epoch == UINT32_MAX || epoch < currentEpoch;
+  if (isFree) {
+    if (epoch < currentEpoch) {
+      const uint32_t stableBoidId = boidIdBySlotInPacket[phoneIndex][slot];
+      if (stableBoidId != UINT32_MAX) {
+        boidSlotInPacketByPhone[phoneIndex][stableBoidId] = -1;
+      }
+      boidIdBySlotInPacket[phoneIndex][slot] = UINT32_MAX;
+      epoch = UINT32_MAX;
+    }
+    markUpdateSlotFree(boidUpdatePackets[phoneIndex][slot]);
+  }
+  freeSlotFlagsByPhone[phoneIndex][slot] = isFree;
+}
+
+__global__ void kernAssignNewPacketSlots(uint32_t phoneCount, uint32_t currentEpoch,
+  const glm::vec3 *boidPositions, const uint32_t *boidIds,
+  const Boids::CameraCullData *cameras, uint32_t **sortedBoidIndicesByPhone,
+  uint32_t **newRanksByPhone, const uint32_t *newCounts,
+  uint32_t **freeSlotsByPhone, const uint32_t *freeCounts,
+  int **boidSlotInPacketByPhone, uint32_t **boidIdBySlotInPacket,
+  uint32_t **packetEpochsByPhone, glm::vec3 **clientPositionsByPhone,
+  Boids::NewBoidData **boidNewPackets) {
+  const uint32_t linearIndex = threadIdx.x + blockIdx.x * blockDim.x;
+  const uint32_t phoneIndex = linearIndex / MAX_BOIDS_PER_PHONE;
+  const uint32_t newIndex = linearIndex % MAX_BOIDS_PER_PHONE;
+  if (phoneIndex >= phoneCount || newIndex >= newCounts[phoneIndex] ||
+      newIndex >= freeCounts[phoneIndex]) {
+    return;
+  }
+
+  const uint32_t selectedRank = newRanksByPhone[phoneIndex][newIndex];
+  const uint32_t slot = freeSlotsByPhone[phoneIndex][newIndex];
+  const uint32_t currentBoidIndex = sortedBoidIndicesByPhone[phoneIndex][selectedRank];
+  const uint32_t stableBoidId = boidIds[currentBoidIndex];
+
+  boidSlotInPacketByPhone[phoneIndex][stableBoidId] = static_cast<int>(slot);
+  boidIdBySlotInPacket[phoneIndex][slot] = stableBoidId;
+  packetEpochsByPhone[phoneIndex][slot] = currentEpoch;
+
+  // New data is compact by newIndex; this return value is precisely the state
+  // reconstructed from the quantized absolute record.
+  Boids::NewBoidData &boidNewData = boidNewPackets[phoneIndex][newIndex];
+  clientPositionsByPhone[phoneIndex][slot] = encodeNewBoidPosition(boidNewData,
+    static_cast<uint16_t>(slot), boidPositions[currentBoidIndex], cameras[phoneIndex]);
+}
+
+__global__ void kernDeriveNetworkPayloadLengths(uint32_t phoneCount,
+  uint32_t currentEpoch, uint32_t **packetEpochsByPhone,
+  const uint32_t *newCounts, uint32_t *updatePayloadLengths,
+  uint32_t *newPayloadLengths) {
+  const uint32_t phoneIndex = blockIdx.x;
+  if (phoneIndex >= phoneCount) {
+    return;
+  }
+
+  uint32_t localHighWater = 0;
+  for (uint32_t slot = threadIdx.x; slot < MAX_BOIDS_PER_PHONE; slot += blockDim.x) {
+    if (packetEpochsByPhone[phoneIndex][slot] == currentEpoch) {
+      localHighWater = slot + 1;
+    }
+  }
+
+  __shared__ uint32_t blockHighWater[blockSize];
+  blockHighWater[threadIdx.x] = localHighWater;
+  __syncthreads();
+  for (uint32_t offset = blockDim.x / 2; offset > 0; offset >>= 1) {
+    if (threadIdx.x < offset) {
+      blockHighWater[threadIdx.x] = imax(blockHighWater[threadIdx.x],
+        blockHighWater[threadIdx.x + offset]);
+    }
+    __syncthreads();
+  }
+
+  if (threadIdx.x == 0) {
+    updatePayloadLengths[phoneIndex] = blockHighWater[0] * sizeof(Boids::UpdateBoidData);
+    newPayloadLengths[phoneIndex] = newCounts[phoneIndex] * sizeof(Boids::NewBoidData);
+  }
+}
+
+void Boids::createNetworkPackets() {
+  if (networkPhoneCount == 0) {
+    return;
+  }
+
+  dim3 blocksPerGrid((numObjects + blockSize - 1) / blockSize);
+  kernCullBoidsByCameras<<<blocksPerGrid, blockSize>>>(numObjects, dev_pos,
+    dev_networkCameras, networkPhoneCount, dev_phoneDistanceBuffers, dev_phoneSortedBoidIndices);
+  checkCUDAErrorWithLine("kernCullBoidsByCameras failed!");
+
+  for (uint32_t phoneIndex = 0; phoneIndex < networkPhoneCount; ++phoneIndex) {
+    thrust::device_ptr<float> distanceBegin =
+      thrust::device_pointer_cast(hostPhoneDistanceBuffers[phoneIndex]);
+    thrust::device_ptr<uint32_t> boidIndexBegin =
+      thrust::device_pointer_cast(hostPhoneSortedBoidIndices[phoneIndex]);
+    thrust::sort_by_key(distanceBegin, distanceBegin + numObjects, boidIndexBegin);
+  }
+
+  dim3 cullCountBlockSize(32, 4);
+  dim3 cullCountBlocksPerGrid((numObjects + cullCountBlockSize.x - 1) / cullCountBlockSize.x,
+    (networkPhoneCount + cullCountBlockSize.y - 1) / cullCountBlockSize.y);
+  kernGetFirstInf<<<cullCountBlocksPerGrid, cullCountBlockSize>>>(numObjects, networkPhoneCount,
+    dev_phoneDistanceBuffers, dev_phoneVisibleCounts);
+  checkCUDAErrorWithLine("kernGetFirstInf failed!");
+
+  const uint32_t packetWorkItems = networkPhoneCount * MAX_BOIDS_PER_PHONE;
+  dim3 packetBlocksPerGrid((packetWorkItems + blockSize - 1) / blockSize);
+  const uint32_t currentEpoch = ++networkEpoch;
+  kernBuildNetworkPackets<<<packetBlocksPerGrid, blockSize>>>(networkPhoneCount,
+    currentEpoch, dev_pos, dev_boidIds, dev_phoneSortedBoidIndices, dev_phoneVisibleCounts,
+    dev_boidSlotInPacketByPhone, dev_clientPositionsByPhone, dev_boidUpdatePackets,
+    dev_boidNewPackets, dev_packetEpochsByPhone, dev_newBoidFlagsByPhone);
+  checkCUDAErrorWithLine("kernBuildNetworkPackets failed!");
+
+  kernClearFreePacketSlots<<<packetBlocksPerGrid, blockSize>>>(networkPhoneCount,
+    currentEpoch, dev_boidSlotInPacketByPhone, dev_boidIdBySlotInPacket,
+    dev_packetEpochsByPhone, dev_boidUpdatePackets, dev_freeSlotFlagsByPhone);
+  checkCUDAErrorWithLine("kernClearFreePacketSlots failed!");
+
+  thrust::counting_iterator<uint32_t> slotIndices(0);
+  for (uint32_t phoneIndex = 0; phoneIndex < networkPhoneCount; ++phoneIndex) {
+    size_t tempStorageBytes = packetCompactionTempStorageBytes;
+    cub::DeviceSelect::Flagged(dev_packetCompactionTempStorage, tempStorageBytes,
+      slotIndices, hostFreeSlotFlagsByPhone[phoneIndex], hostFreeSlotsByPhone[phoneIndex],
+      dev_phoneFreeCounts + phoneIndex, MAX_BOIDS_PER_PHONE);
+    cub::DeviceSelect::Flagged(dev_packetCompactionTempStorage, tempStorageBytes,
+      slotIndices, hostNewBoidFlagsByPhone[phoneIndex], hostNewRanksByPhone[phoneIndex],
+      dev_phoneNewCounts + phoneIndex, MAX_BOIDS_PER_PHONE);
+  }
+
+  std::vector<uint32_t> newBoidCounts(networkPhoneCount);
+  std::vector<int32_t> visibleLastIndices(networkPhoneCount);
+  cudaMemcpy(newBoidCounts.data(), dev_phoneNewCounts,
+    networkPhoneCount * sizeof(uint32_t), cudaMemcpyDeviceToHost);
+  checkCUDAErrorWithLine("cudaMemcpy compacted new-boid counts failed!");
+  cudaMemcpy(visibleLastIndices.data(), dev_phoneVisibleCounts,
+    networkPhoneCount * sizeof(int32_t), cudaMemcpyDeviceToHost);
+  checkCUDAErrorWithLine("cudaMemcpy visible boid counts failed!");
+  for (uint32_t phoneIndex = 0; phoneIndex < networkPhoneCount; ++phoneIndex) {
+    const uint32_t selectedCount = visibleLastIndices[phoneIndex] < 0 ? 0u :
+      static_cast<uint32_t>(visibleLastIndices[phoneIndex]) + 1u;
+    const uint32_t updateCount = selectedCount - newBoidCounts[phoneIndex];
+    printf("Phone %u compacted packet data: %u boid updates, %u new boids\n", phoneIndex,
+      updateCount, newBoidCounts[phoneIndex]);
+  }
+
+  kernAssignNewPacketSlots<<<packetBlocksPerGrid, blockSize>>>(networkPhoneCount,
+    currentEpoch, dev_pos, dev_boidIds, dev_networkCameras, dev_phoneSortedBoidIndices,
+    dev_newRanksByPhone, dev_phoneNewCounts, dev_freeSlotsByPhone, dev_phoneFreeCounts,
+    dev_boidSlotInPacketByPhone, dev_boidIdBySlotInPacket, dev_packetEpochsByPhone,
+    dev_clientPositionsByPhone, dev_boidNewPackets);
+  checkCUDAErrorWithLine("kernAssignNewPacketSlots failed!");
+
+  kernDeriveNetworkPayloadLengths<<<networkPhoneCount, blockSize>>>(networkPhoneCount,
+    currentEpoch, dev_packetEpochsByPhone, dev_phoneNewCounts,
+    dev_phoneUpdatePayloadLengths, dev_phoneNewPayloadLengths);
+  checkCUDAErrorWithLine("kernDeriveNetworkPayloadLengths failed!");
+
   cudaDeviceSynchronize();
+}
 
-  std::vector<uint32_t> phonePacketSizes(phoneCount);
-  cudaMemcpy(phonePacketSizes.data(), dev_phonePacketSizes, phoneCount * sizeof(uint32_t),
-    cudaMemcpyDeviceToHost);
-  size_t totalPacketBytes = 0;
-  for (uint32_t packetBytes : phonePacketSizes) {
-    totalPacketBytes += packetBytes;
+void Boids::cullBoidsByCameras(const CameraCullData *cameras, bool *cameraChanged,
+  uint32_t phoneCount) {
+  if (phoneCount != networkPhoneCount) {
+    initializeNetworkPhones(cameras, phoneCount);
   }
-  printf("Network packet compression complete: %zu bytes across %u phones\n",
-    totalPacketBytes, phoneCount);
+  if (phoneCount == 0) {
+    return;
+  }
+
+  for (uint32_t phone_idx = 0; phone_idx < phoneCount; phone_idx++) {
+    if (!cameraChanged[phone_idx]) {
+      continue;
+    }
+    cudaMemcpy(dev_networkCameras + phone_idx, cameras + phone_idx,
+      sizeof(CameraCullData), cudaMemcpyHostToDevice);
+    checkCUDAErrorWithLine("cudaMemcpy changed network camera failed!");
+    cameraChanged[phone_idx] = false;
+  }
+
+  createNetworkPackets();
 }
 
-uint8_t* const* Boids::getDevicePhonePackets() {
-  return dev_phonePacketBuffers;
+float* const* Boids::getDevicePhoneDistances() {
+  return dev_phoneDistanceBuffers;
 }
 
-const uint32_t* Boids::getDevicePhonePacketSizes() {
-  return dev_phonePacketSizes;
+const int32_t* Boids::getDevicePhoneVisibleCounts() {
+  return dev_phoneVisibleCounts;
+}
+
+const uint32_t* Boids::getDevicePhoneUpdatePayloadLengths() {
+  return dev_phoneUpdatePayloadLengths;
+}
+
+const uint32_t* Boids::getDevicePhoneNewPayloadLengths() {
+  return dev_phoneNewPayloadLengths;
+}
+
+Boids::UpdateBoidData* const* Boids::getDevicePhoneUpdatePayloads() {
+  return dev_boidUpdatePackets;
+}
+
+Boids::NewBoidData* const* Boids::getDevicePhoneNewPayloads() {
+  return dev_boidNewPackets;
 }
 
 void Boids::stepSimulationCoherentGrid(float dt) {
@@ -887,6 +1186,8 @@ void Boids::stepSimulationCoherentGrid(float dt) {
     // Reorder particle data into sorted grid-cell order.
     thrust::gather(dev_thrust_particleArrayIndices, dev_thrust_particleArrayIndices + numObjects, dev_thrust_pos, dev_thrust_pos2);
     thrust::gather(dev_thrust_particleArrayIndices, dev_thrust_particleArrayIndices + numObjects, dev_thrust_vel1, dev_thrust_vel2);
+    thrust::gather(dev_thrust_particleArrayIndices, dev_thrust_particleArrayIndices + numObjects,
+      dev_thrust_boidIds, dev_thrust_boidIds2);
 
     glm::vec3 *tempPos = dev_pos;
     dev_pos = dev_pos2;
@@ -895,6 +1196,14 @@ void Boids::stepSimulationCoherentGrid(float dt) {
     thrust::device_ptr<glm::vec3> tempThrustPos = dev_thrust_pos;
     dev_thrust_pos = dev_thrust_pos2;
     dev_thrust_pos2 = tempThrustPos;
+
+    uint32_t *tempBoidIds = dev_boidIds;
+    dev_boidIds = dev_boidIds2;
+    dev_boidIds2 = tempBoidIds;
+
+    thrust::device_ptr<uint32_t> tempThrustBoidIds = dev_thrust_boidIds;
+    dev_thrust_boidIds = dev_thrust_boidIds2;
+    dev_thrust_boidIds2 = tempThrustBoidIds;
 
     glm::vec3 *tempVel = dev_vel1;
     dev_vel1 = dev_vel2;
@@ -927,24 +1236,49 @@ void Boids::stepSimulationCoherentGrid(float dt) {
 void Boids::endSimulation() {
   cudaFree(dev_vel1);
   cudaFree(dev_vel2);
+  cudaFree(dev_boidIds);
+  cudaFree(dev_boidIds2);
   cudaFree(dev_pos);
   cudaFree(dev_pos2);
   cudaFree(dev_particleArrayIndices);
   cudaFree(dev_particleGridIndices);
   cudaFree(dev_gridCellStartIndices);
   cudaFree(dev_gridCellEndIndices);
-  cudaFree(dev_flockKeys);
-  cudaFree(dev_flockIndices);
-  cudaFree(dev_flockHeadFlags);
-  cudaFree(dev_flockGroupIds);
-  cudaFree(dev_flocks);
-  cudaFree(dev_compressedBoids);
-  cudaFree(dev_flockCount);
-  for (uint8_t *packetBuffer : hostPhonePacketBuffers) {
-    cudaFree(packetBuffer);
+  for (float *distanceBuffer : hostPhoneDistanceBuffers) {
+    cudaFree(distanceBuffer);
+  }
+  for (int *slotMap : hostBoidSlotInPacketByPhone) {
+    cudaFree(slotMap);
+  }
+  for (glm::vec3 *clientPositions : hostClientPositionsByPhone) {
+    cudaFree(clientPositions);
+  }
+  for (Boids::UpdateBoidData *updatePacket : hostBoidUpdatePackets) {
+    cudaFree(updatePacket);
+  }
+  for (Boids::NewBoidData *newPacket : hostBoidNewPackets) {
+    cudaFree(newPacket);
+  }
+  for (uint32_t *packetEpochs : hostPacketEpochsByPhone) {
+    cudaFree(packetEpochs);
   }
   cudaFree(dev_networkCameras);
-  cudaFree(dev_phonePacketBuffers);
-  cudaFree(dev_phonePacketSizes);
-
+  cudaFree(dev_phoneDistanceBuffers);
+  cudaFree(dev_phoneSortedBoidIndices);
+  cudaFree(dev_phoneVisibleCounts);
+  cudaFree(dev_boidSlotInPacketByPhone);
+  cudaFree(dev_clientPositionsByPhone);
+  cudaFree(dev_boidUpdatePackets);
+  cudaFree(dev_boidNewPackets);
+  cudaFree(dev_packetEpochsByPhone);
+  cudaFree(dev_boidIdBySlotInPacket);
+  cudaFree(dev_freeSlotFlagsByPhone);
+  cudaFree(dev_newBoidFlagsByPhone);
+  cudaFree(dev_freeSlotsByPhone);
+  cudaFree(dev_newRanksByPhone);
+  cudaFree(dev_phoneFreeCounts);
+  cudaFree(dev_phoneNewCounts);
+  cudaFree(dev_phoneUpdatePayloadLengths);
+  cudaFree(dev_phoneNewPayloadLengths);
+  cudaFree(dev_packetCompactionTempStorage);
 }

@@ -9,6 +9,7 @@
 #include "main.hpp"
 #include "kernel.h"
 
+#include <chrono>
 #include <iostream>
 #include <memory>
 #include <sstream>
@@ -22,11 +23,12 @@
 // ================
 
 
-const int N_FOR_VIS = 30000;
+const int N_FOR_VIS = 40000;
 const float DT = 0.2f;
-#define VISUALIZE 1
-const double FLOCK_UPDATE_INTERVAL_SECONDS = 1.0 / 20.0;
-const float NETWORK_CULL_DISTANCE = 240.0f;
+#ifndef VISUALIZE
+#define VISUALIZE 0
+#endif
+const double NETWORK_UPDATE_INTERVAL_SECONDS = 1.0 / 20.0;
 
 /**
 * C main function.
@@ -49,6 +51,16 @@ int main(int argc, char* argv[]) {
 
 std::string deviceName;
 GLFWwindow *window;
+
+double simulationClockSeconds() {
+#if VISUALIZE
+  return glfwGetTime();
+#else
+  static const auto startTime = std::chrono::steady_clock::now();
+  const auto elapsed = std::chrono::steady_clock::now() - startTime;
+  return std::chrono::duration<double>(elapsed).count();
+#endif
+}
 
 /**
 * Initialization of CUDA and GLFW.
@@ -74,7 +86,8 @@ bool init(int argc, char **argv) {
   ss << projectName << " [SM " << major << "." << minor << " " << deviceProp.name << "]";
   deviceName = ss.str();
 
-  // Window setup stuff
+  // Rendering setup is not needed in compute-only mode.
+#if VISUALIZE
   glfwSetErrorCallback(errorCallback);
 
   if (!glfwInit()) {
@@ -114,16 +127,31 @@ bool init(int argc, char **argv) {
 
   cudaGLRegisterBufferObject(boidVBO_positions);
   cudaGLRegisterBufferObject(boidVBO_velocities);
+#endif
 
   // Initialize N-body simulation
   Boids::initSimulation(N_FOR_VIS);
-  networkCameras.resize(cameras.size());
-  Boids::initializeNetworkPhones(static_cast<uint32_t>(networkCameras.size()));
 
+#if VISUALIZE
   initShaders(program);
-  updateCamera();
+#endif
+  updateAllCameras();
 
+  networkCameras.resize(cameras.size());
+  networkCameraChanged = std::make_unique<bool[]>(cameras.size());
+  for (std::size_t cameraIndex = 0; cameraIndex < cameras.size(); ++cameraIndex) {
+    networkCameras[cameraIndex] = {
+      cameras[cameraIndex].getPosition(),
+      cameras[cameraIndex].getProjMat(),
+    };
+    networkCameraChanged[cameraIndex] = false;
+  }
+  Boids::initializeNetworkPhones(networkCameras.data(),
+    static_cast<uint32_t>(networkCameras.size()));
+
+#if VISUALIZE
   glEnable(GL_DEPTH_TEST);
+#endif
 
   return true;
 }
@@ -173,7 +201,9 @@ void initVAO() {
   glBufferData(GL_ELEMENT_ARRAY_BUFFER, (N_FOR_VIS) * sizeof(GLuint), bindices.get(), GL_STATIC_DRAW);
 
   glBindBuffer(GL_SHADER_STORAGE_BUFFER, boidVBO_cameras);
-  glBufferData(GL_SHADER_STORAGE_BUFFER, 0, nullptr, GL_DYNAMIC_DRAW);
+  cameraBufferEntryCapacity = cameras.size() + 1;
+  glBufferData(GL_SHADER_STORAGE_BUFFER, cameraBufferEntryCapacity * sizeof(glm::mat4),
+    nullptr, GL_DYNAMIC_DRAW);
   glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, boidVBO_cameras);
 
   glBindVertexArray(cameraIconVAO);
@@ -207,43 +237,48 @@ void initShaders(GLuint * program) {
   // Main loop
   //====================================
   void runCUDA() {
+#if VISUALIZE
     // Map OpenGL buffer object for writing from CUDA on a single GPU
     // No data is moved (Win & Linux). When mapped to CUDA, OpenGL should not
     // use this buffer
-
-    float4 *dptr = NULL;
     float *dptrVertPositions = NULL;
     float *dptrVertVelocities = NULL;
 
     cudaGLMapBufferObject((void**)&dptrVertPositions, boidVBO_positions);
     cudaGLMapBufferObject((void**)&dptrVertVelocities, boidVBO_velocities);
+#endif
 
     Boids::stepSimulationCoherentGrid(DT);
 
-    static double lastFlockUpdateTime = -FLOCK_UPDATE_INTERVAL_SECONDS;
-    const double currentTime = glfwGetTime();
-    if (currentTime - lastFlockUpdateTime >= FLOCK_UPDATE_INTERVAL_SECONDS) {
-      for (std::size_t cameraIndex = 0; cameraIndex < cameras.size(); ++cameraIndex) {
-        networkCameras[cameraIndex] = {
-          cameras[cameraIndex].getPosition(),
-          NETWORK_CULL_DISTANCE,
-          cameras[cameraIndex].getProjMat(),
-        };
-      }
-      Boids::createNetworkPackets(networkCameras.data(),
+    static double lastNetworkUpdateTime = -NETWORK_UPDATE_INTERVAL_SECONDS;
+    const double currentTime = simulationClockSeconds();
+#if !VISUALIZE
+    static double rateSampleStartTime = currentTime;
+    static uint32_t stepsSinceRateSample = 0;
+    ++stepsSinceRateSample;
+    const double rateSampleDuration = currentTime - rateSampleStartTime;
+    if (rateSampleDuration >= 1.0) {
+      printf("%.1f simulation steps/s\n", stepsSinceRateSample / rateSampleDuration);
+      rateSampleStartTime = currentTime;
+      stepsSinceRateSample = 0;
+    }
+#endif
+    if (currentTime - lastNetworkUpdateTime >= NETWORK_UPDATE_INTERVAL_SECONDS) {
+      Boids::cullBoidsByCameras(networkCameras.data(), networkCameraChanged.get(),
         static_cast<uint32_t>(networkCameras.size()));
-      lastFlockUpdateTime = currentTime;
+      lastNetworkUpdateTime = currentTime;
     }
 
-    #if VISUALIZE
+#if VISUALIZE
     Boids::copyBoidsToVBO(dptrVertPositions, dptrVertVelocities);
-    #endif
     // unmap buffer object
     cudaGLUnmapBufferObject(boidVBO_positions);
     cudaGLUnmapBufferObject(boidVBO_velocities);
+#endif
   }
 
   void mainLoop() {
+#if VISUALIZE
     double fps = 0;
     double timebase = 0;
     int frame = 0;
@@ -293,6 +328,11 @@ void initShaders(GLuint * program) {
     }
     glfwDestroyWindow(window);
     glfwTerminate();
+#else
+    while (true) {
+      runCUDA();
+    }
+#endif
   }
 
 
@@ -307,11 +347,13 @@ void initShaders(GLuint * program) {
     if (key == GLFW_KEY_F && action == GLFW_PRESS) {
       useGlobalCamera = false;
       currCamera = (currCamera + 1) % static_cast<int>(cameras.size());
-      updateCamera();
+      updateCameraIcons();
+      updateActiveCameraUniform();
     }
     if (key == GLFW_KEY_G && action == GLFW_PRESS) {
       useGlobalCamera = !useGlobalCamera;
-      updateCamera();
+      updateCameraIcons();
+      updateActiveCameraUniform();
     }
     if (!useGlobalCamera && (action == GLFW_PRESS || action == GLFW_REPEAT)) {
       constexpr float moveStep = 0.25f;
@@ -323,7 +365,8 @@ void initShaders(GLuint * program) {
       if (key == GLFW_KEY_E) cameras[currCamera].move(0.0f, 0.0f, moveStep);
       if (key == GLFW_KEY_W || key == GLFW_KEY_S || key == GLFW_KEY_A ||
           key == GLFW_KEY_D || key == GLFW_KEY_Q || key == GLFW_KEY_E) {
-        updateCamera();
+        updateLocalCamera(currCamera);
+        updateNetworkCamera(currCamera);
       }
     }
   }
@@ -340,27 +383,28 @@ void initShaders(GLuint * program) {
       } else {
         cameras[currCamera].rotate((xpos - lastX) / width, -(ypos - lastY) / height);
       }
-      updateCamera();
+      if (!useGlobalCamera) {
+        updateLocalCamera(currCamera);
+        updateNetworkCamera(currCamera);
+      } else {
+        updateGlobalCamera();
+      }
     } else if (rightMousePressed && useGlobalCamera) {
       globalCamera.changeZoom((ypos - lastY) / height * 100.0f);
-      updateCamera();
+      updateGlobalCamera();
     }
 
 	lastX = xpos;
 	lastY = ypos;
   }
 
-  void updateCamera() {
-    std::vector<glm::mat4> cameraMatrices(cameras.size() + 1);
+  void updateCameraIcons() {
+#if VISUALIZE
     std::vector<glm::vec4> cameraIconPositions;
     std::vector<glm::vec4> cameraIconColors;
     cameraIconPositions.reserve(cameras.size() * cameraIconVerticesPerCamera);
     cameraIconColors.reserve(cameras.size() * cameraIconVerticesPerCamera);
-    const float aspectRatio = static_cast<float>(width) / static_cast<float>(height);
     for (std::size_t i = 0; i < cameras.size(); ++i) {
-      cameras[i].update(aspectRatio);
-      cameraMatrices[i] = cameras[i].getProjMat();
-
       if (!useGlobalCamera && static_cast<int>(i) == currCamera) {
         continue;
       }
@@ -392,13 +436,6 @@ void initShaders(GLuint * program) {
       addIconEdge(bottomLeft, tip);
     }
     cameraIconVertexCount = static_cast<GLsizei>(cameraIconPositions.size());
-    globalCamera.update(aspectRatio);
-    cameraMatrices[cameras.size()] = globalCamera.getProjMat();
-
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, boidVBO_cameras);
-    glBufferData(GL_SHADER_STORAGE_BUFFER, cameraMatrices.size() * sizeof(glm::mat4),
-                 cameraMatrices.data(), GL_DYNAMIC_DRAW);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, boidVBO_cameras);
 
     glBindBuffer(GL_ARRAY_BUFFER, cameraIconVBO_positions);
     glBufferData(GL_ARRAY_BUFFER, cameraIconPositions.size() * sizeof(glm::vec4),
@@ -406,7 +443,11 @@ void initShaders(GLuint * program) {
     glBindBuffer(GL_ARRAY_BUFFER, cameraIconVBO_colors);
     glBufferData(GL_ARRAY_BUFFER, cameraIconColors.size() * sizeof(glm::vec4),
                  cameraIconColors.data(), GL_DYNAMIC_DRAW);
+#endif
+  }
 
+  void updateActiveCameraUniform() {
+#if VISUALIZE
     const int activeCameraIndex = useGlobalCamera ? static_cast<int>(cameras.size()) : currCamera;
     for (GLuint shaderProgram : program) {
       glUseProgram(shaderProgram);
@@ -416,4 +457,84 @@ void initShaders(GLuint * program) {
       }
     }
     glUseProgram(0);
+#endif
+  }
+
+  void updateAllCameras() {
+    const float aspectRatio = static_cast<float>(width) / static_cast<float>(height);
+    std::vector<glm::mat4> cameraMatrices(cameras.size() + 1);
+    for (std::size_t cameraIndex = 0; cameraIndex < cameras.size(); ++cameraIndex) {
+      cameras[cameraIndex].update(aspectRatio);
+      cameraMatrices[cameraIndex] = cameras[cameraIndex].getProjMat();
+    }
+    globalCamera.update(aspectRatio);
+    cameraMatrices[cameras.size()] = globalCamera.getProjMat();
+
+#if VISUALIZE
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, boidVBO_cameras);
+    if (cameraMatrices.size() > cameraBufferEntryCapacity) {
+      cameraBufferEntryCapacity = cameraMatrices.size();
+      glBufferData(GL_SHADER_STORAGE_BUFFER, cameraBufferEntryCapacity * sizeof(glm::mat4),
+        nullptr, GL_DYNAMIC_DRAW);
+    }
+    glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
+      cameraMatrices.size() * sizeof(glm::mat4), cameraMatrices.data());
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, boidVBO_cameras);
+#endif
+
+    updateCameraIcons();
+    updateActiveCameraUniform();
+  }
+
+  void updateLocalCamera(std::size_t cameraIndex) {
+#if VISUALIZE
+    if (cameras.size() + 1 > cameraBufferEntryCapacity) {
+      updateAllCameras();
+      return;
+    }
+#endif
+
+    const float aspectRatio = static_cast<float>(width) / static_cast<float>(height);
+    cameras[cameraIndex].update(aspectRatio);
+#if VISUALIZE
+    const glm::mat4 &projMat = cameras[cameraIndex].getProjMat();
+
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, boidVBO_cameras);
+    glBufferSubData(GL_SHADER_STORAGE_BUFFER, cameraIndex * sizeof(glm::mat4),
+      sizeof(glm::mat4), &projMat);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, boidVBO_cameras);
+#endif
+
+    updateCameraIcons();
+    updateActiveCameraUniform();
+  }
+
+  void updateGlobalCamera() {
+#if VISUALIZE
+    if (cameras.size() + 1 > cameraBufferEntryCapacity) {
+      updateAllCameras();
+      return;
+    }
+#endif
+
+    const float aspectRatio = static_cast<float>(width) / static_cast<float>(height);
+    globalCamera.update(aspectRatio);
+#if VISUALIZE
+    const glm::mat4 &projMat = globalCamera.getProjMat();
+
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, boidVBO_cameras);
+    glBufferSubData(GL_SHADER_STORAGE_BUFFER, cameras.size() * sizeof(glm::mat4),
+      sizeof(glm::mat4), &projMat);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, boidVBO_cameras);
+#endif
+
+    updateActiveCameraUniform();
+  }
+
+  void updateNetworkCamera(std::size_t cameraIndex) {
+    networkCameras[cameraIndex] = {
+      cameras[cameraIndex].getPosition(),
+      cameras[cameraIndex].getProjMat(),
+    };
+    networkCameraChanged[cameraIndex] = true;
   }

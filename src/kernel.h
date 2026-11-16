@@ -4,50 +4,58 @@
 #include <glm/glm.hpp>
 
 namespace Boids {
-    struct Flock {
-        glm::vec3 position;
-        float radius;
-        glm::vec3 direction;
-        uint32_t startIndex;
-        uint32_t numBoids;
+    constexpr float cullDistance = 900.0f;
+    constexpr uint16_t NEW_BOID_POLAR_ENCODING_BIT = 0x8000u;
+    constexpr uint16_t NEW_BOID_SLOT_MASK = 0x7FFFu;
+
+    struct ViewPositionEncoding {
+        uint8_t x_pos;
+        uint8_t y_pos;
+        uint16_t depth;
     };
 
-    struct CompressedBoid {
-        uint8_t radius;
+    struct PolarPositionEncoding {
         uint8_t azimuth;
-        uint8_t polar;
-        uint8_t rotationX;
-        uint8_t rotationY;
-        uint8_t rotationZ;
+        uint8_t elevation;
+        uint16_t radial_depth;
     };
-    static_assert(sizeof(CompressedBoid) == 6, "Compressed boids must occupy six bytes");
 
     struct CameraCullData {
         glm::vec3 position;
-        float maxDistance;
         glm::mat4 projMat;
     };
 
-    struct NetworkFlock {
-        glm::vec3 position;
-        float radius;
-        glm::vec3 direction;
-        uint32_t numBoids;
+    struct NewBoidData {
+        // Bit 15 is 1 for polar encoding and 0 for view-grid encoding.
+        // Bits 0-14 hold the packet slot.
+        uint16_t new_idx_slot;
+        union {
+            ViewPositionEncoding view;
+            PolarPositionEncoding polar;
+        } position;
     };
-    static_assert(sizeof(NetworkFlock) == 32, "Network flock metadata must occupy 32 bytes");
+    static_assert(sizeof(NewBoidData) == 6, "New boid records must occupy six bytes");
+
+    struct UpdateBoidData {
+        int16_t pos_delta[3];
+    };
+    static_assert(sizeof(UpdateBoidData) == 6, "Update boid records must occupy six bytes");
 
     void initSimulation(int N);
     void stepSimulationCoherentGrid(float dt);
-    void computeFlocks();
-    void initializeNetworkPhones(uint32_t phoneCount);
-    void createNetworkPackets(const CameraCullData *cameras, uint32_t phoneCount);
+    void initializeNetworkPhones(const CameraCullData *cameras, uint32_t phoneCount);
+    void createNetworkPackets();
+    void cullBoidsByCameras(const CameraCullData *cameras, bool *cameraChanged,
+                            uint32_t phoneCount);
     void copyBoidsToVBO(float *vbodptr_positions, float *vbodptr_velocities);
 
-    const Flock* getDeviceFlocks();
-    const CompressedBoid* getDeviceCompressedBoids();
-    const uint32_t* getDeviceFlockCount();
-    uint8_t* const* getDevicePhonePackets();
-    const uint32_t* getDevicePhonePacketSizes();
+    const uint32_t* getDeviceBoidIds();
+    float* const* getDevicePhoneDistances();
+    const int32_t* getDevicePhoneVisibleCounts();
+    const uint32_t* getDevicePhoneUpdatePayloadLengths();
+    const uint32_t* getDevicePhoneNewPayloadLengths();
+    UpdateBoidData* const* getDevicePhoneUpdatePayloads();
+    NewBoidData* const* getDevicePhoneNewPayloads();
 
     void endSimulation();
 }

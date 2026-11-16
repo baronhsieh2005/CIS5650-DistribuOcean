@@ -5,6 +5,7 @@
 #include "utilityCore.hpp"
 #include "camera.hpp"
 #include "globalCamera.hpp"
+#include <memory>
 #include <vector>
 #include <glm/glm.hpp>
 #include <GLFW/glfw3.h>
@@ -21,6 +22,7 @@ GLuint boidVAO = 0;
 GLuint boidVBO_positions = 0;
 GLuint boidVBO_velocities = 0;
 GLuint boidVBO_cameras = 0;
+std::size_t cameraBufferEntryCapacity = 0;
 GLuint boidIBO = 0;
 GLuint cameraIconVAO = 0;
 GLuint cameraIconVBO_positions = 0;
@@ -52,6 +54,7 @@ std::vector<Camera> cameras = {
     Camera(2.10f, 1.45f, 45.0f, glm::vec3(0.0f, 75.0f, 0.0f)),
 };
 std::vector<Boids::CameraCullData> networkCameras;
+std::unique_ptr<bool[]> networkCameraChanged;
 GlobalCamera globalCamera;
 double lastX = 0.0;
 double lastY = 0.0;
@@ -72,7 +75,12 @@ void errorCallback(int error, const char *description);
 void keyCallback(GLFWwindow* window, int key, int scancode, int action, int mods);
 void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods);
 void mousePositionCallback(GLFWwindow* window, double xpos, double ypos);
-void updateCamera();
+void updateAllCameras();
+void updateLocalCamera(std::size_t cameraIndex);
+void updateGlobalCamera();
+void updateCameraIcons();
+void updateActiveCameraUniform();
+void updateNetworkCamera(std::size_t cameraIndex);
 void runCUDA();
 
 //====================================
