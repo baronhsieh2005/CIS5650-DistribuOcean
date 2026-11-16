@@ -248,26 +248,64 @@ void initShaders(GLuint * program) {
     cudaGLMapBufferObject((void**)&dptrVertVelocities, boidVBO_velocities);
 #endif
 
+#if DEBUG_MODE
+    static uint32_t packetsSinceRateSample = 0;
+    static double simulationSecondsSinceRateSample = 0.0;
+    static double packetSecondsSinceRateSample = 0.0;
+    const double simulationStartTime = simulationClockSeconds();
+#endif
+
     Boids::stepSimulationCoherentGrid(DT);
+
+#if DEBUG_MODE
+    simulationSecondsSinceRateSample += simulationClockSeconds() - simulationStartTime;
+#endif
 
     static double lastNetworkUpdateTime = -NETWORK_UPDATE_INTERVAL_SECONDS;
     const double currentTime = simulationClockSeconds();
-#if !VISUALIZE
+#if !VISUALIZE || DEBUG_MODE
     static double rateSampleStartTime = currentTime;
     static uint32_t stepsSinceRateSample = 0;
     ++stepsSinceRateSample;
+#endif
+    if (currentTime - lastNetworkUpdateTime >= NETWORK_UPDATE_INTERVAL_SECONDS) {
+#if DEBUG_MODE
+      const double packetStartTime = simulationClockSeconds();
+#endif
+      Boids::cullBoidsByCameras(networkCameras.data(), networkCameraChanged.get(),
+        static_cast<uint32_t>(networkCameras.size()));
+#if DEBUG_MODE
+      packetSecondsSinceRateSample += simulationClockSeconds() - packetStartTime;
+      ++packetsSinceRateSample;
+#endif
+      lastNetworkUpdateTime = currentTime;
+    }
+
+#if !VISUALIZE || DEBUG_MODE
     const double rateSampleDuration = currentTime - rateSampleStartTime;
     if (rateSampleDuration >= 1.0) {
-      printf("%.1f simulation steps/s\n", stepsSinceRateSample / rateSampleDuration);
+      printf("%.1f simulation steps/s", stepsSinceRateSample / rateSampleDuration);
+#if DEBUG_MODE
+      const double averageSimulationSeconds = simulationSecondsSinceRateSample / stepsSinceRateSample;
+      printf(" | simulation: %.3f ms/step (%.1f Hz)", averageSimulationSeconds * 1000.0,
+        1.0 / averageSimulationSeconds);
+      if (packetsSinceRateSample > 0) {
+        const double averagePacketSeconds = packetSecondsSinceRateSample / packetsSinceRateSample;
+        printf(" | network: %u packets (%.1f packets/s), %.3f ms/packet (%.1f Hz)",
+          packetsSinceRateSample, packetsSinceRateSample / rateSampleDuration,
+          averagePacketSeconds * 1000.0, 1.0 / averagePacketSeconds);
+      } else {
+        printf(" | network: 0 packets");
+      }
+      simulationSecondsSinceRateSample = 0.0;
+      packetSecondsSinceRateSample = 0.0;
+      packetsSinceRateSample = 0;
+#endif
+      printf("\n");
       rateSampleStartTime = currentTime;
       stepsSinceRateSample = 0;
     }
 #endif
-    if (currentTime - lastNetworkUpdateTime >= NETWORK_UPDATE_INTERVAL_SECONDS) {
-      Boids::cullBoidsByCameras(networkCameras.data(), networkCameraChanged.get(),
-        static_cast<uint32_t>(networkCameras.size()));
-      lastNetworkUpdateTime = currentTime;
-    }
 
 #if VISUALIZE
     Boids::copyBoidsToVBO(dptrVertPositions, dptrVertVelocities);

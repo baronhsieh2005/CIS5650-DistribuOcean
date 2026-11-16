@@ -10,10 +10,8 @@
 #include <vector>
 
 #include <thrust/sort.h>
-#include <thrust/gather.h>
 #include <thrust/device_ptr.h>
 #include <thrust/iterator/counting_iterator.h>
-#include <thrust/random.h>
 #include <cub/cub.cuh>
 
 #include <glm/glm.hpp>
@@ -26,100 +24,25 @@
 #define imin( a, b ) ( ((a) < (b)) ? (a) : (b) )
 #endif
 
-#define checkCUDAErrorWithLine(msg) checkCUDAError(msg, __LINE__)
-
-/**
-* Check for CUDA errors; print and exit if there was a problem.
-*/
-void checkCUDAError(const char *msg, int line = -1) {
-  cudaError_t err = cudaGetLastError();
-  if (cudaSuccess != err) {
-    if (line >= 0) {
-      fprintf(stderr, "Line %d: ", line);
-    }
-    fprintf(stderr, "Cuda error: %s: %s.\n", msg, cudaGetErrorString(err));
-    exit(EXIT_FAILURE);
-  }
-}
-
-
-/*****************
-* Configuration *
-*****************/
-
-/*! Block size used for CUDA kernel launch. */
 #define blockSize 128
-
-#define rule1Distance 15.0f
-#define rule2Distance 9.0f
-#define rule3Distance 15.0f
-
-#define rule1Scale 0.01f
-#define rule2Scale 0.1f
-#define rule3Scale 0.1f
-
-#define maxSpeed 3.0f
-
-/*! Size of the starting area in simulation space. */
-#define scene_scale 300.0f
-#define spawnFlockRadius 90.0f
+#define checkCUDAErrorWithLine(msg) checkCUDAError(msg, __LINE__)
 
 #define cullDistanceTolerance 36.0f
 #define cullFrustumTolerance 0.12f
-
 #define MAX_BOIDS_PER_PHONE 20000
-
 #define DIST_VIEW 0
 #define DIST_SPHERE 1
 #define MIXED 2
-
-#ifndef CULL_TYPE
 #define CULL_TYPE DIST_VIEW
-#endif
-
-// MIXED keeps every nearby boid while a camera turns, then uses a slightly
-// expanded frustum for the remainder of the camera's distance range.
 #define mixedCullSphereFraction 0.5f
-
-// Each signed 16-bit position-delta component represents 1/1024 simulation units.
-// The encodable displacement range per packet is approximately [-32, 32] units.
 #define networkPositionDeltaScale (1.0f / 1024.0f)
 #define networkPositionDepthMaxDistance (Boids::cullDistance + cullDistanceTolerance)
-
-// All three uint16_t components set to this value denote a free/deleted slot.
 #define networkUpdateFreeComponent 0xFFFFu
 
-/***********************************************
-* Kernel state (pointers are device pointers) *
-***********************************************/
-
-int numObjects;
-glm::vec3 *dev_pos;
-glm::vec3 *dev_pos2;
-glm::vec3 *dev_vel1;
-glm::vec3 *dev_vel2;
-uint32_t *dev_boidIds;
-uint32_t *dev_boidIds2;
-
-int *dev_particleArrayIndices;
-int *dev_particleGridIndices;
-thrust::device_ptr<int> dev_thrust_particleArrayIndices;
-thrust::device_ptr<int> dev_thrust_particleGridIndices;
-thrust::device_ptr<glm::vec3> dev_thrust_vel1;
-thrust::device_ptr<glm::vec3> dev_thrust_vel2;
-thrust::device_ptr<glm::vec3> dev_thrust_pos;
-thrust::device_ptr<glm::vec3> dev_thrust_pos2;
-thrust::device_ptr<uint32_t> dev_thrust_boidIds;
-thrust::device_ptr<uint32_t> dev_thrust_boidIds2;
-
-int *dev_gridCellStartIndices;
-int *dev_gridCellEndIndices;
-
-int gridCellCount;
-int gridSideCount;
-float gridCellWidth;
-float gridInverseCellWidth;
-glm::vec3 gridMinimum;
+void checkCUDAError(const char *msg, int line);
+extern int numObjects;
+extern glm::vec3 *dev_pos;
+extern uint32_t *dev_boidIds;
 
 Boids::CameraCullData *dev_networkCameras;
 float **dev_phoneDistanceBuffers;
@@ -157,375 +80,6 @@ std::vector<uint8_t *> hostNewBoidFlagsByPhone;
 std::vector<uint32_t *> hostFreeSlotsByPhone;
 std::vector<uint32_t *> hostNewRanksByPhone;
 
-/******************
-* initSimulation *
-******************/
-
-__host__ __device__ unsigned int hash(unsigned int a) {
-  a = (a + 0x7ed55d16) + (a << 12);
-  a = (a ^ 0xc761c23c) ^ (a >> 19);
-  a = (a + 0x165667b1) + (a << 5);
-  a = (a + 0xd3a2646c) ^ (a << 9);
-  a = (a + 0xfd7046c5) + (a << 3);
-  a = (a ^ 0xb55a4f09) ^ (a >> 16);
-  return a;
-}
-
-__host__ __device__ glm::vec3 generateRandomVec3(float time, int index) {
-  thrust::default_random_engine rng(hash((int)(index * time)));
-  thrust::uniform_real_distribution<float> unitDistrib(-1, 1);
-
-  return glm::vec3((float)unitDistrib(rng), (float)unitDistrib(rng), (float)unitDistrib(rng));
-}
-
-__global__ void kernGenerateRandomPosArray(int time, int N, glm::vec3 * arr, float scale) {
-  int index = (blockIdx.x * blockDim.x) + threadIdx.x;
-  if (index < N) {
-    glm::vec3 rand = generateRandomVec3(time, index);
-    arr[index].x = scale * rand.x;
-    arr[index].y = scale * rand.y;
-    arr[index].z = scale * rand.z;
-  }
-}
-
-__global__ void kernGenerateFlockPositions(int time, int N, glm::vec3 *pos) {
-  int index = (blockIdx.x * blockDim.x) + threadIdx.x;
-  if (index >= N) {
-    return;
-  }
-
-  glm::vec3 flockCenter;
-  switch (index % 3) {
-    case 0: flockCenter = glm::vec3(-75.0f, -30.0f, 0.0f); break;
-    case 1: flockCenter = glm::vec3(75.0f, -30.0f, 0.0f); break;
-    default: flockCenter = glm::vec3(0.0f, 75.0f, 0.0f); break;
-  }
-
-  pos[index] = flockCenter + generateRandomVec3(time, index) * spawnFlockRadius;
-}
-
-__global__ void kernInitializeBoidIds(int N, uint32_t *boidIds) {
-  const int index = threadIdx.x + blockIdx.x * blockDim.x;
-  if (index < N) {
-    boidIds[index] = static_cast<uint32_t>(index);
-  }
-}
-
-/**
-* Initialize memory, update some globals
-*/
-void Boids::initSimulation(int N) {
-  numObjects = N;
-  dim3 fullBlocksPerGrid((N + blockSize - 1) / blockSize);
-
-  cudaMalloc((void**)&dev_pos, N * sizeof(glm::vec3));
-  checkCUDAErrorWithLine("cudaMalloc dev_pos failed!");
-
-  cudaMalloc((void**)&dev_pos2, N * sizeof(glm::vec3));
-  checkCUDAErrorWithLine("cudaMalloc dev_pos2 failed!");
-
-  cudaMalloc((void**)&dev_vel1, N * sizeof(glm::vec3));
-  checkCUDAErrorWithLine("cudaMalloc dev_vel1 failed!");
-
-  cudaMalloc((void**)&dev_vel2, N * sizeof(glm::vec3));
-  checkCUDAErrorWithLine("cudaMalloc dev_vel2 failed!");
-
-  cudaMalloc((void**)&dev_boidIds, N * sizeof(uint32_t));
-  checkCUDAErrorWithLine("cudaMalloc dev_boidIds failed!");
-  cudaMalloc((void**)&dev_boidIds2, N * sizeof(uint32_t));
-  checkCUDAErrorWithLine("cudaMalloc dev_boidIds2 failed!");
-  kernInitializeBoidIds<<<fullBlocksPerGrid, blockSize>>>(N, dev_boidIds);
-  checkCUDAErrorWithLine("kernInitializeBoidIds failed!");
-
-  // Initialize velocity to random values
-  cudaMemset(dev_vel1, 0, N * sizeof(glm::vec3));
-  checkCUDAErrorWithLine("cudaMemset dev_vel1 failed!");
-
-  kernGenerateRandomPosArray<<<fullBlocksPerGrid, blockSize>>>(1, numObjects,
-    dev_vel1, maxSpeed);
-  checkCUDAErrorWithLine("kernGenerateRandomPosArray failed!");
-
-  cudaMemset(dev_vel2, 0, N * sizeof(glm::vec3));
-  checkCUDAErrorWithLine("cudaMemset dev_vel2 failed!");
-
-  kernGenerateFlockPositions<<<fullBlocksPerGrid, blockSize>>>(1, numObjects, dev_pos);
-  checkCUDAErrorWithLine("kernGenerateFlockPositions failed!");
-
-  gridCellWidth = 2.0f * std::max(std::max(rule1Distance, rule2Distance), rule3Distance);
-  int halfSideCount = (int)(scene_scale / gridCellWidth) + 1;
-  gridSideCount = 2 * halfSideCount;
-
-  gridCellCount = gridSideCount * gridSideCount * gridSideCount;
-  gridInverseCellWidth = 1.0f / gridCellWidth;
-  float halfGridWidth = gridCellWidth * halfSideCount;
-  gridMinimum = glm::vec3(0.0f);
-  gridMinimum.x -= halfGridWidth;
-  gridMinimum.y -= halfGridWidth;
-  gridMinimum.z -= halfGridWidth;
-
-  cudaMalloc((void**)&dev_particleArrayIndices, numObjects * sizeof(int));
-  checkCUDAErrorWithLine("cudaMalloc dev_particleArrayIndices failed!");
-
-  cudaMalloc((void**)&dev_particleGridIndices, numObjects * sizeof(int));
-  checkCUDAErrorWithLine("cudaMalloc dev_particleGridIndices failed!");
-
-  cudaMalloc((void**)&dev_gridCellStartIndices, gridCellCount * sizeof(int));
-  checkCUDAErrorWithLine("cudaMalloc dev_gridCellStartIndices failed!");
-
-  cudaMalloc((void**)&dev_gridCellEndIndices, gridCellCount * sizeof(int));
-  checkCUDAErrorWithLine("cudaMalloc dev_gridCellEndIndices failed!");
-
-  // needed for use with thrust
-  dev_thrust_particleArrayIndices = thrust::device_pointer_cast(dev_particleArrayIndices);
-  dev_thrust_particleGridIndices = thrust::device_pointer_cast(dev_particleGridIndices);
-  dev_thrust_vel1 = thrust::device_pointer_cast(dev_vel1);
-  dev_thrust_vel2 = thrust::device_pointer_cast(dev_vel2);
-  dev_thrust_pos = thrust::device_pointer_cast(dev_pos);
-  dev_thrust_pos2 = thrust::device_pointer_cast(dev_pos2);
-  dev_thrust_boidIds = thrust::device_pointer_cast(dev_boidIds);
-  dev_thrust_boidIds2 = thrust::device_pointer_cast(dev_boidIds2);
-
-  cudaDeviceSynchronize();
-}
-
-
-/******************
-* copyBoidsToVBO *
-******************/
-
-/**
-* Copy the boid positions into the VBO so that they can be drawn by OpenGL.
-*/
-__global__ void kernCopyPositionsToVBO(int N, glm::vec3 *pos, float *vbo, float s_scale) {
-  int index = threadIdx.x + (blockIdx.x * blockDim.x);
-
-  float c_scale = 1.0f;
-
-  if (index < N) {
-    vbo[4 * index + 0] = pos[index].x * c_scale;
-    vbo[4 * index + 1] = pos[index].y * c_scale;
-    vbo[4 * index + 2] = pos[index].z * c_scale;
-    vbo[4 * index + 3] = 1.0f;
-  }
-}
-
-__global__ void kernCopyVelocitiesToVBO(int N, glm::vec3 *vel, float *vbo, float s_scale) {
-  int index = threadIdx.x + (blockIdx.x * blockDim.x);
-
-  if (index < N) {
-    vbo[4 * index + 0] = vel[index].x + 0.3f;
-    vbo[4 * index + 1] = vel[index].y + 0.3f;
-    vbo[4 * index + 2] = vel[index].z + 0.3f;
-    vbo[4 * index + 3] = 1.0f;
-  }
-}
-
-/**
-* Wrapper for call to the kernCopyboidsToVBO CUDA kernel.
-*/
-void Boids::copyBoidsToVBO(float *vbodptr_positions, float *vbodptr_velocities) {
-  dim3 fullBlocksPerGrid((numObjects + blockSize - 1) / blockSize);
-
-  kernCopyPositionsToVBO << <fullBlocksPerGrid, blockSize >> >(numObjects, dev_pos, vbodptr_positions, scene_scale);
-  kernCopyVelocitiesToVBO << <fullBlocksPerGrid, blockSize >> >(numObjects, dev_vel1, vbodptr_velocities, scene_scale);
-
-  checkCUDAErrorWithLine("copyBoidsToVBO failed!");
-
-  cudaDeviceSynchronize();
-}
-
-
-/******************
-* stepSimulation *
-******************/
-
-__global__ void kernUpdatePos(int N, float dt, glm::vec3 *pos, glm::vec3 *vel) {
-  // Update position by velocity
-  int index = threadIdx.x + (blockIdx.x * blockDim.x);
-  if (index >= N) {
-    return;
-  }
-  glm::vec3 thisPos = pos[index];
-  thisPos += vel[index] * dt;
-
-  // Wrap the boids around so we don't lose them
-  thisPos.x = thisPos.x < -scene_scale ? scene_scale : thisPos.x;
-  thisPos.y = thisPos.y < -scene_scale ? scene_scale : thisPos.y;
-  thisPos.z = thisPos.z < -scene_scale ? scene_scale : thisPos.z;
-
-  thisPos.x = thisPos.x > scene_scale ? -scene_scale : thisPos.x;
-  thisPos.y = thisPos.y > scene_scale ? -scene_scale : thisPos.y;
-  thisPos.z = thisPos.z > scene_scale ? -scene_scale : thisPos.z;
-
-  pos[index] = thisPos;
-}
-
-__device__ int gridIndex3Dto1D(int x, int y, int z, int gridResolution) {
-  return x + y * gridResolution + z * gridResolution * gridResolution;
-}
-
-__global__ void kernComputeIndices(int N, int gridResolution,
-  glm::vec3 gridMin, float inverseCellWidth,
-  glm::vec3 *pos, int *indices, int *gridIndices) {
-    int i = threadIdx.x + (blockIdx.x * blockDim.x);
-    if (i >= N) {
-      return;
-    }
-
-    glm::vec3 boidPos = pos[i];
-    int x = imin(imax((int)floor((boidPos.x - gridMin.x) * inverseCellWidth), 0), gridResolution - 1);
-    int y = imin(imax((int)floor((boidPos.y - gridMin.y) * inverseCellWidth), 0), gridResolution - 1);
-    int z = imin(imax((int)floor((boidPos.z - gridMin.z) * inverseCellWidth), 0), gridResolution - 1);
-
-    indices[i] = i;
-    gridIndices[i] = gridIndex3Dto1D(x, y, z, gridResolution);
-}
-
-__global__ void kernResetIntBuffer(int N, int *intBuffer, int value) {
-  int index = (blockIdx.x * blockDim.x) + threadIdx.x;
-  if (index < N) {
-    intBuffer[index] = value;
-  }
-}
-
-__global__ void kernIdentifyCellStartEnd(int N, int *particleGridIndices,
-  int *gridCellStartIndices, int *gridCellEndIndices) {
-  int index = threadIdx.x + (blockIdx.x * blockDim.x);
-  if (index >= N || index < 0) {
-    return;
-  }
-
-  if (index == 0) {
-    gridCellStartIndices[particleGridIndices[index]] = index;
-  }
-  if (index == N - 1) {
-    gridCellEndIndices[particleGridIndices[index]] = index;
-  }
-  if (index > 0 && particleGridIndices[index] != particleGridIndices[index - 1]) {
-    gridCellStartIndices[particleGridIndices[index]] = index;
-    gridCellEndIndices[particleGridIndices[index - 1]] = index - 1;
-  }
-}
-
-__device__ void calculateNeighborVelChangeCoherent(int cellX, int cellY, int cellZ, int dx, int dy, int dz,
-    int gridResolution, int *gridCellStartIndices, int *gridCellEndIndices,
-    glm::vec3 *pos, glm::vec3 *vel1, glm::vec3 boidPos, int boidIndex,
-    glm::vec3 &perceived_center, int &num_neighbors_r1, glm::vec3 &c, glm::vec3 &perceived_velocity,
-    int &num_neighbors_r3) {
-  int neighborCellX = cellX + dx;
-  int neighborCellY = cellY + dy;
-  int neighborCellZ = cellZ + dz;
-
-  if (neighborCellX < 0 || neighborCellX >= gridResolution ||
-    neighborCellY < 0 || neighborCellY >= gridResolution ||
-    neighborCellZ < 0 || neighborCellZ >= gridResolution) {
-      return;
-    }
-
-  int neighborCell = gridIndex3Dto1D(neighborCellX, neighborCellY, neighborCellZ, gridResolution);
-
-  int startIndex = gridCellStartIndices[neighborCell];
-  int endIndex = gridCellEndIndices[neighborCell];
-
-  if (startIndex < 0 || endIndex < 0) {
-    return;
-  }
-
-  for (int i = startIndex; i <= endIndex; i++) {
-    int neighborBoid = i;
-    if (neighborBoid == boidIndex) {
-      continue;
-    }
-
-    // rule 1
-    if (glm::distance(boidPos, pos[neighborBoid]) < rule1Distance) {
-      perceived_center += pos[neighborBoid];
-      num_neighbors_r1++;
-    }
-
-    // rule 2
-    if (glm::distance(boidPos, pos[neighborBoid]) < rule2Distance) {
-      c -= (pos[neighborBoid] - boidPos);
-    }
-
-    // rule 3
-    if (glm::distance(boidPos, pos[neighborBoid]) < rule3Distance) {
-      perceived_velocity += vel1[neighborBoid];
-      num_neighbors_r3++;
-    }
-  }
-}
-
-__global__ void kernUpdateVelNeighborSearchCoherent(
-  int N, int gridResolution, glm::vec3 gridMin,
-  float inverseCellWidth,
-  int *gridCellStartIndices, int *gridCellEndIndices,
-  glm::vec3 *pos, glm::vec3 *vel1, glm::vec3 *vel2) {
-  // rule 1
-  glm::vec3 perceived_center = glm::vec3(0.0f, 0.0f, 0.0f);
-  int num_neighbors_r1 = 0;
-
-  // rule 2
-  glm::vec3 c = glm::vec3(0.0f, 0.0f, 0.0f);
-
-  // rule 3
-  glm::vec3 perceived_velocity = glm::vec3(0.0f, 0.0f, 0.0f);
-  int num_neighbors_r3 = 0;
-
-  int boidIndex = threadIdx.x + (blockIdx.x * blockDim.x);
-  if (boidIndex >= N) {
-    return;
-  }
-
-  glm::vec3 boidPos = pos[boidIndex];
-  int cellX = floor((boidPos.x - gridMin.x) * inverseCellWidth);
-  int cellY = floor((boidPos.y - gridMin.y) * inverseCellWidth);
-  int cellZ = floor((boidPos.z - gridMin.z) * inverseCellWidth);
-
-  // calculate if lower half or upper half all 3 dims to get dx, dy, dz
-  float localX = (boidPos.x - gridMin.x) * inverseCellWidth - cellX;
-  float localY = (boidPos.y - gridMin.y) * inverseCellWidth - cellY;
-  float localZ = (boidPos.z - gridMin.z) * inverseCellWidth - cellZ;
-  int dx = localX < 0.5f ? -1 : 1;
-  int dy = localY < 0.5f ? -1 : 1;
-  int dz = localZ < 0.5f ? -1 : 1;
-
-  calculateNeighborVelChangeCoherent(cellX, cellY, cellZ, 0, 0, 0, gridResolution, gridCellStartIndices, gridCellEndIndices, pos, vel1, boidPos, boidIndex, perceived_center, num_neighbors_r1, c, perceived_velocity, num_neighbors_r3);
-  calculateNeighborVelChangeCoherent(cellX, cellY, cellZ, dx, 0, 0, gridResolution, gridCellStartIndices, gridCellEndIndices, pos, vel1, boidPos, boidIndex, perceived_center, num_neighbors_r1, c, perceived_velocity, num_neighbors_r3);
-  calculateNeighborVelChangeCoherent(cellX, cellY, cellZ, 0, dy, 0, gridResolution, gridCellStartIndices, gridCellEndIndices, pos, vel1, boidPos, boidIndex, perceived_center, num_neighbors_r1, c, perceived_velocity, num_neighbors_r3);
-  calculateNeighborVelChangeCoherent(cellX, cellY, cellZ, 0, 0, dz, gridResolution, gridCellStartIndices, gridCellEndIndices, pos, vel1, boidPos, boidIndex, perceived_center, num_neighbors_r1, c, perceived_velocity, num_neighbors_r3);
-  calculateNeighborVelChangeCoherent(cellX, cellY, cellZ, dx, dy, 0, gridResolution, gridCellStartIndices, gridCellEndIndices, pos, vel1, boidPos, boidIndex, perceived_center, num_neighbors_r1, c, perceived_velocity, num_neighbors_r3);
-  calculateNeighborVelChangeCoherent(cellX, cellY, cellZ, dx, 0, dz, gridResolution, gridCellStartIndices, gridCellEndIndices, pos, vel1, boidPos, boidIndex, perceived_center, num_neighbors_r1, c, perceived_velocity, num_neighbors_r3);
-  calculateNeighborVelChangeCoherent(cellX, cellY, cellZ, 0, dy, dz, gridResolution, gridCellStartIndices, gridCellEndIndices, pos, vel1, boidPos, boidIndex, perceived_center, num_neighbors_r1, c, perceived_velocity, num_neighbors_r3);
-  calculateNeighborVelChangeCoherent(cellX, cellY, cellZ, dx, dy, dz, gridResolution, gridCellStartIndices, gridCellEndIndices, pos, vel1, boidPos, boidIndex, perceived_center, num_neighbors_r1, c, perceived_velocity, num_neighbors_r3);
-
-
-  glm::vec3 rule1_vel_change = glm::vec3(0.0f, 0.0f, 0.0f);
-  glm::vec3 rule3_vel_change = glm::vec3(0.0f, 0.0f, 0.0f);
-
-  if (num_neighbors_r1 != 0) {
-    perceived_center /= num_neighbors_r1;
-    rule1_vel_change = (perceived_center - boidPos) * rule1Scale;
-  }
-
-  if (num_neighbors_r3 != 0) {
-    perceived_velocity /= num_neighbors_r3;
-    rule3_vel_change = perceived_velocity * rule3Scale;
-  }
-
-  glm::vec3 rule2_vel_change = c * rule2Scale;
-  glm::vec3 newVel = vel1[boidIndex] + rule1_vel_change + rule2_vel_change + rule3_vel_change;
-
-  if (glm::length(newVel) > maxSpeed) {
-    newVel = glm::normalize(newVel) * maxSpeed;
-  }
-  vel2[boidIndex] = newVel;
-}
-
-const uint32_t* Boids::getDeviceBoidIds() {
-  return dev_boidIds;
-}
-
 __device__ bool isInsideCameraFrustum(const glm::vec3 &position,
   const Boids::CameraCullData &camera, float tolerance) {
   const glm::vec4 clipPosition = camera.projMat * glm::vec4(position, 1.0f);
@@ -557,8 +111,6 @@ __device__ bool shouldBoidSurviveNaive(uint32_t boidIndex,
   }
   return distance <= Boids::cullDistance + cullDistanceTolerance &&
     isInsideCameraFrustum(positions[boidIndex], camera, cullFrustumTolerance);
-#else
-#error "CULL_TYPE must be DIST_VIEW, DIST_SPHERE, or MIXED"
 #endif
 }
 
@@ -817,7 +369,7 @@ __global__ void kernGetFirstInf(uint32_t boidCount, uint32_t phoneCount,
 
 __device__ int16_t quantizeNetworkDelta(float delta) {
   const int quantized = static_cast<int>(roundf(delta / networkPositionDeltaScale));
-  return static_cast<int16_t>(imax(-32768, imin(32767, quantized)));
+  return static_cast<int16_t>(imax(-0x8000, imin(0x7FFF, quantized)));
 }
 
 __device__ void markUpdateSlotFree(Boids::UpdateBoidData &update) {
@@ -838,16 +390,16 @@ __device__ bool usePolarNewBoidEncoding(const glm::vec3 &position,
 }
 
 __device__ uint8_t quantizeUnitFloat(float value) {
-  return static_cast<uint8_t>(roundf(fminf(1.0f, fmaxf(0.0f, value)) * 255.0f));
+  return static_cast<uint8_t>(roundf(fminf(1.0f, fmaxf(0.0f, value)) * 0xFF));
 }
 
 __device__ uint16_t quantizeNetworkDepth(float distance) {
   return static_cast<uint16_t>(roundf(fminf(1.0f,
-    fmaxf(0.0f, distance / networkPositionDepthMaxDistance)) * 65535.0f));
+    fmaxf(0.0f, distance / networkPositionDepthMaxDistance)) * 0xFFFF));
 }
 
 __device__ float dequantizeNetworkDepth(uint16_t depth) {
-  return static_cast<float>(depth) * networkPositionDepthMaxDistance / 65535.0f;
+  return static_cast<float>(depth) * networkPositionDepthMaxDistance / 0xFFFF;
 }
 
 __device__ glm::vec3 encodeNewBoidPosition(Boids::NewBoidData &boidNewData,
@@ -995,8 +547,6 @@ __global__ void kernAssignNewPacketSlots(uint32_t phoneCount, uint32_t currentEp
   boidIdBySlotInPacket[phoneIndex][slot] = stableBoidId;
   packetEpochsByPhone[phoneIndex][slot] = currentEpoch;
 
-  // New data is compact by newIndex; this return value is precisely the state
-  // reconstructed from the quantized absolute record.
   Boids::NewBoidData &boidNewData = boidNewPackets[phoneIndex][newIndex];
   clientPositionsByPhone[phoneIndex][slot] = encodeNewBoidPosition(boidNewData,
     static_cast<uint16_t>(slot), boidPositions[currentBoidIndex], cameras[phoneIndex]);
@@ -1062,7 +612,7 @@ void Boids::createNetworkPackets() {
 
   const uint32_t packetWorkItems = networkPhoneCount * MAX_BOIDS_PER_PHONE;
   dim3 packetBlocksPerGrid((packetWorkItems + blockSize - 1) / blockSize);
-  const uint32_t currentEpoch = ++networkEpoch;
+  const uint32_t currentEpoch = networkEpoch++;
   kernBuildNetworkPackets<<<packetBlocksPerGrid, blockSize>>>(networkPhoneCount,
     currentEpoch, dev_pos, dev_boidIds, dev_phoneSortedBoidIndices, dev_phoneVisibleCounts,
     dev_boidSlotInPacketByPhone, dev_clientPositionsByPhone, dev_boidUpdatePackets,
@@ -1075,16 +625,17 @@ void Boids::createNetworkPackets() {
   checkCUDAErrorWithLine("kernClearFreePacketSlots failed!");
 
   thrust::counting_iterator<uint32_t> slotIndices(0);
-  for (uint32_t phoneIndex = 0; phoneIndex < networkPhoneCount; ++phoneIndex) {
+  for (uint32_t phone_idx = 0; phone_idx < networkPhoneCount; ++phone_idx) {
     size_t tempStorageBytes = packetCompactionTempStorageBytes;
     cub::DeviceSelect::Flagged(dev_packetCompactionTempStorage, tempStorageBytes,
-      slotIndices, hostFreeSlotFlagsByPhone[phoneIndex], hostFreeSlotsByPhone[phoneIndex],
-      dev_phoneFreeCounts + phoneIndex, MAX_BOIDS_PER_PHONE);
+      slotIndices, hostFreeSlotFlagsByPhone[phone_idx], hostFreeSlotsByPhone[phone_idx],
+      dev_phoneFreeCounts + phone_idx, MAX_BOIDS_PER_PHONE);
     cub::DeviceSelect::Flagged(dev_packetCompactionTempStorage, tempStorageBytes,
-      slotIndices, hostNewBoidFlagsByPhone[phoneIndex], hostNewRanksByPhone[phoneIndex],
-      dev_phoneNewCounts + phoneIndex, MAX_BOIDS_PER_PHONE);
+      slotIndices, hostNewBoidFlagsByPhone[phone_idx], hostNewRanksByPhone[phone_idx],
+      dev_phoneNewCounts + phone_idx, MAX_BOIDS_PER_PHONE);
   }
 
+#if DEBUG_PACKET_LENGTHS
   std::vector<uint32_t> newBoidCounts(networkPhoneCount);
   std::vector<int32_t> visibleLastIndices(networkPhoneCount);
   cudaMemcpy(newBoidCounts.data(), dev_phoneNewCounts,
@@ -1093,13 +644,14 @@ void Boids::createNetworkPackets() {
   cudaMemcpy(visibleLastIndices.data(), dev_phoneVisibleCounts,
     networkPhoneCount * sizeof(int32_t), cudaMemcpyDeviceToHost);
   checkCUDAErrorWithLine("cudaMemcpy visible boid counts failed!");
-  for (uint32_t phoneIndex = 0; phoneIndex < networkPhoneCount; ++phoneIndex) {
-    const uint32_t selectedCount = visibleLastIndices[phoneIndex] < 0 ? 0u :
-      static_cast<uint32_t>(visibleLastIndices[phoneIndex]) + 1u;
-    const uint32_t updateCount = selectedCount - newBoidCounts[phoneIndex];
-    printf("Phone %u compacted packet data: %u boid updates, %u new boids\n", phoneIndex,
-      updateCount, newBoidCounts[phoneIndex]);
+  for (uint32_t phone_idx = 0; phone_idx < networkPhoneCount; ++phone_idx) {
+    const uint32_t selectedCount = visibleLastIndices[phone_idx] < 0 ? 0u :
+      static_cast<uint32_t>(visibleLastIndices[phone_idx]) + 1u;
+    const uint32_t updateCount = selectedCount - newBoidCounts[phone_idx];
+    printf("Phone %u compacted packet data: %u boid updates, %u new boids\n", phone_idx,
+      updateCount, newBoidCounts[phone_idx]);
   }
+#endif
 
   kernAssignNewPacketSlots<<<packetBlocksPerGrid, blockSize>>>(networkPhoneCount,
     currentEpoch, dev_pos, dev_boidIds, dev_networkCameras, dev_phoneSortedBoidIndices,
@@ -1162,88 +714,8 @@ Boids::NewBoidData* const* Boids::getDevicePhoneNewPayloads() {
   return dev_boidNewPackets;
 }
 
-void Boids::stepSimulationCoherentGrid(float dt) {
-    dim3 fullBlocksPerGrid((numObjects + blockSize - 1) / blockSize);
-    int gridResolution = gridSideCount;
 
-    dim3 fullBlocksPerGridGrid((gridCellCount + blockSize - 1) / blockSize);
-
-    kernResetIntBuffer<<<fullBlocksPerGridGrid, blockSize>>>(gridCellCount, dev_gridCellStartIndices, -1);
-    checkCUDAErrorWithLine("kernResetIntBuffer failed!");
-
-    kernResetIntBuffer<<<fullBlocksPerGridGrid, blockSize>>>(gridCellCount, dev_gridCellEndIndices, -1);
-    checkCUDAErrorWithLine("kernResetIntBuffer failed!");
-
-    kernComputeIndices<<<fullBlocksPerGrid, blockSize>>>(numObjects, gridResolution,
-      gridMinimum, gridInverseCellWidth, dev_pos, dev_particleArrayIndices, dev_particleGridIndices);
-    checkCUDAErrorWithLine("kernComputeIndices failed!");
-
-    thrust::sort_by_key(dev_thrust_particleGridIndices, dev_thrust_particleGridIndices + numObjects, dev_thrust_particleArrayIndices);
-
-    kernIdentifyCellStartEnd<<<fullBlocksPerGrid, blockSize>>>(numObjects, dev_particleGridIndices, dev_gridCellStartIndices, dev_gridCellEndIndices);
-    checkCUDAErrorWithLine("kernIdentifyCellStartEnd failed!");
-
-    // Reorder particle data into sorted grid-cell order.
-    thrust::gather(dev_thrust_particleArrayIndices, dev_thrust_particleArrayIndices + numObjects, dev_thrust_pos, dev_thrust_pos2);
-    thrust::gather(dev_thrust_particleArrayIndices, dev_thrust_particleArrayIndices + numObjects, dev_thrust_vel1, dev_thrust_vel2);
-    thrust::gather(dev_thrust_particleArrayIndices, dev_thrust_particleArrayIndices + numObjects,
-      dev_thrust_boidIds, dev_thrust_boidIds2);
-
-    glm::vec3 *tempPos = dev_pos;
-    dev_pos = dev_pos2;
-    dev_pos2 = tempPos;
-
-    thrust::device_ptr<glm::vec3> tempThrustPos = dev_thrust_pos;
-    dev_thrust_pos = dev_thrust_pos2;
-    dev_thrust_pos2 = tempThrustPos;
-
-    uint32_t *tempBoidIds = dev_boidIds;
-    dev_boidIds = dev_boidIds2;
-    dev_boidIds2 = tempBoidIds;
-
-    thrust::device_ptr<uint32_t> tempThrustBoidIds = dev_thrust_boidIds;
-    dev_thrust_boidIds = dev_thrust_boidIds2;
-    dev_thrust_boidIds2 = tempThrustBoidIds;
-
-    glm::vec3 *tempVel = dev_vel1;
-    dev_vel1 = dev_vel2;
-    dev_vel2 = tempVel;
-
-    thrust::device_ptr<glm::vec3> tempThrustVel = dev_thrust_vel1;
-    dev_thrust_vel1 = dev_thrust_vel2;
-    dev_thrust_vel2 = tempThrustVel;
-
-    kernUpdateVelNeighborSearchCoherent<<<fullBlocksPerGrid, blockSize>>>(numObjects, gridResolution, gridMinimum, gridInverseCellWidth, dev_gridCellStartIndices, dev_gridCellEndIndices, dev_pos, dev_vel1, dev_vel2);
-    checkCUDAErrorWithLine("kernUpdateVelNeighborSearchCoherent failed!");
-
-    tempVel = dev_vel1;
-    dev_vel1 = dev_vel2;
-    dev_vel2 = tempVel;
-
-    tempThrustVel = dev_thrust_vel1;
-    dev_thrust_vel1 = dev_thrust_vel2;
-    dev_thrust_vel2 = tempThrustVel;
-
-    kernUpdatePos<<<fullBlocksPerGrid, blockSize>>>(numObjects, dt, dev_pos, dev_vel1);
-    checkCUDAErrorWithLine("kernUpdatePos failed!");
-
-    // kernComputeCameraCulling<<<fullBlocksPerGrid, blockSize>>>();
-    // checkCUDAErrorWithLine("kernComputeCameraCulling failed!");
-
-    cudaDeviceSynchronize();
-}
-
-void Boids::endSimulation() {
-  cudaFree(dev_vel1);
-  cudaFree(dev_vel2);
-  cudaFree(dev_boidIds);
-  cudaFree(dev_boidIds2);
-  cudaFree(dev_pos);
-  cudaFree(dev_pos2);
-  cudaFree(dev_particleArrayIndices);
-  cudaFree(dev_particleGridIndices);
-  cudaFree(dev_gridCellStartIndices);
-  cudaFree(dev_gridCellEndIndices);
+void releaseNetworkBuffers() {
   for (float *distanceBuffer : hostPhoneDistanceBuffers) {
     cudaFree(distanceBuffer);
   }

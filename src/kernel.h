@@ -3,6 +3,11 @@
 #include <cstdint>
 #include <glm/glm.hpp>
 
+#ifndef DEBUG_MODE
+#define DEBUG_MODE 1
+#define DEBUG_PACKET_LENGTHS 0
+#endif
+
 namespace Boids {
     constexpr float cullDistance = 900.0f;
     constexpr uint16_t NEW_BOID_POLAR_ENCODING_BIT = 0x8000u;
