@@ -4,6 +4,7 @@
 #include "kernel.h"
 #include "utilityCore.hpp"
 #include "camera.hpp"
+#include "threadpool.hpp"
 #include "globalCamera.hpp"
 #include <memory>
 #include <vector>
@@ -55,6 +56,7 @@ std::vector<Camera> cameras = {
 };
 std::vector<Boids::CameraCullData> networkCameras;
 std::unique_ptr<bool[]> networkCameraChanged;
+std::unique_ptr<bool[]> networkCameraChangedSnapshot;
 GlobalCamera globalCamera;
 double lastX = 0.0;
 double lastY = 0.0;
@@ -89,3 +91,5 @@ void runCUDA();
 bool init(int argc, char **argv);
 void initVAO();
 void initShaders(GLuint *program);
+ThreadPool *getThreadPool();
+void deleteThreadPool();

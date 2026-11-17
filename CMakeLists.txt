@@ -62,6 +62,7 @@ set(sources
     src/glslUtility.cpp
     src/camera.cpp
     src/globalCamera.cpp
+    src/threadpool.cpp
     src/simulation.cu
     src/network.cu
     src/main.cpp

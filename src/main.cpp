@@ -9,6 +9,7 @@
 #include "main.hpp"
 #include "kernel.h"
 
+#include <atomic>
 #include <chrono>
 #include <iostream>
 #include <memory>
@@ -17,6 +18,8 @@
 #include <cuda_runtime.h>
 #include <cuda_gl_interop.h>
 #include <glm/gtc/matrix_transform.hpp>
+
+#include "threadpool.hpp"
 
 // ================
 // Configuration
@@ -51,6 +54,10 @@ int main(int argc, char* argv[]) {
 
 std::string deviceName;
 GLFWwindow *window;
+static ThreadPool *thd_pool;
+#if DEBUG_MODE
+static std::atomic<uint32_t> completedNetworkPackets{0};
+#endif
 
 double simulationClockSeconds() {
 #if VISUALIZE
@@ -85,6 +92,9 @@ bool init(int argc, char **argv) {
   std::ostringstream ss;
   ss << projectName << " [SM " << major << "." << minor << " " << deviceProp.name << "]";
   deviceName = ss.str();
+
+  // Setup threadpool
+  thd_pool = new ThreadPool(std::thread::hardware_concurrency()-1);
 
   // Rendering setup is not needed in compute-only mode.
 #if VISUALIZE
@@ -139,12 +149,14 @@ bool init(int argc, char **argv) {
 
   networkCameras.resize(cameras.size());
   networkCameraChanged = std::make_unique<bool[]>(cameras.size());
+  networkCameraChangedSnapshot = std::make_unique<bool[]>(cameras.size());
   for (std::size_t cameraIndex = 0; cameraIndex < cameras.size(); ++cameraIndex) {
     networkCameras[cameraIndex] = {
       cameras[cameraIndex].getPosition(),
       cameras[cameraIndex].getProjMat(),
     };
     networkCameraChanged[cameraIndex] = false;
+    networkCameraChangedSnapshot[cameraIndex] = false;
   }
   Boids::initializeNetworkPhones(networkCameras.data(),
     static_cast<uint32_t>(networkCameras.size()));
@@ -248,18 +260,7 @@ void initShaders(GLuint * program) {
     cudaGLMapBufferObject((void**)&dptrVertVelocities, boidVBO_velocities);
 #endif
 
-#if DEBUG_MODE
-    static uint32_t packetsSinceRateSample = 0;
-    static double simulationSecondsSinceRateSample = 0.0;
-    static double packetSecondsSinceRateSample = 0.0;
-    const double simulationStartTime = simulationClockSeconds();
-#endif
-
     Boids::stepSimulationCoherentGrid(DT);
-
-#if DEBUG_MODE
-    simulationSecondsSinceRateSample += simulationClockSeconds() - simulationStartTime;
-#endif
 
     static double lastNetworkUpdateTime = -NETWORK_UPDATE_INTERVAL_SECONDS;
     const double currentTime = simulationClockSeconds();
@@ -269,37 +270,35 @@ void initShaders(GLuint * program) {
     ++stepsSinceRateSample;
 #endif
     if (currentTime - lastNetworkUpdateTime >= NETWORK_UPDATE_INTERVAL_SECONDS) {
+      Boids::prepareSimulationSnapshotsForNetwork();
+
+      for (std::size_t cameraIndex = 0; cameraIndex < networkCameras.size(); ++cameraIndex) {
+        networkCameraChangedSnapshot[cameraIndex] = networkCameraChanged[cameraIndex];
+        networkCameraChanged[cameraIndex] = false;
+      }
+
+      getThreadPool()->AddTask([cameras = networkCameras,
+        cameraChanged = networkCameraChangedSnapshot.get()]() {
+        Boids::cullBoidsByCameras(cameras.data(), cameraChanged,
+          static_cast<uint32_t>(cameras.size()));
 #if DEBUG_MODE
-      const double packetStartTime = simulationClockSeconds();
+        completedNetworkPackets.fetch_add(1, std::memory_order_relaxed);
 #endif
-      Boids::cullBoidsByCameras(networkCameras.data(), networkCameraChanged.get(),
-        static_cast<uint32_t>(networkCameras.size()));
-#if DEBUG_MODE
-      packetSecondsSinceRateSample += simulationClockSeconds() - packetStartTime;
-      ++packetsSinceRateSample;
-#endif
+      });
       lastNetworkUpdateTime = currentTime;
-    }
+    } 
 
 #if !VISUALIZE || DEBUG_MODE
     const double rateSampleDuration = currentTime - rateSampleStartTime;
     if (rateSampleDuration >= 1.0) {
       printf("%.1f simulation steps/s", stepsSinceRateSample / rateSampleDuration);
 #if DEBUG_MODE
-      const double averageSimulationSeconds = simulationSecondsSinceRateSample / stepsSinceRateSample;
-      printf(" | simulation: %.3f ms/step (%.1f Hz)", averageSimulationSeconds * 1000.0,
-        1.0 / averageSimulationSeconds);
-      if (packetsSinceRateSample > 0) {
-        const double averagePacketSeconds = packetSecondsSinceRateSample / packetsSinceRateSample;
-        printf(" | network: %u packets (%.1f packets/s), %.3f ms/packet (%.1f Hz)",
-          packetsSinceRateSample, packetsSinceRateSample / rateSampleDuration,
-          averagePacketSeconds * 1000.0, 1.0 / averagePacketSeconds);
-      } else {
-        printf(" | network: 0 packets");
-      }
-      simulationSecondsSinceRateSample = 0.0;
-      packetSecondsSinceRateSample = 0.0;
-      packetsSinceRateSample = 0;
+      static uint32_t previouslyCompletedNetworkPackets = 0;
+      const uint32_t completedPackets = completedNetworkPackets.load(std::memory_order_relaxed);
+      const uint32_t packetsSinceRateSample = completedPackets - previouslyCompletedNetworkPackets;
+      printf(" | %u packet builds completed (%.1f packets/s)", packetsSinceRateSample,
+        packetsSinceRateSample / rateSampleDuration);
+      previouslyCompletedNetworkPackets = completedPackets;
 #endif
       printf("\n");
       rateSampleStartTime = currentTime;
@@ -576,3 +575,12 @@ void initShaders(GLuint * program) {
     };
     networkCameraChanged[cameraIndex] = true;
   }
+
+ThreadPool *getThreadPool() {
+    return thd_pool;
+}
+
+void deleteThreadPool() {
+    thd_pool->Stop();
+    delete thd_pool;
+}

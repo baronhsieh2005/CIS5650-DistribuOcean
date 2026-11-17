@@ -61,6 +61,7 @@ namespace Boids {
     const uint32_t* getDevicePhoneNewPayloadLengths();
     UpdateBoidData* const* getDevicePhoneUpdatePayloads();
     NewBoidData* const* getDevicePhoneNewPayloads();
+    void prepareSimulationSnapshotsForNetwork();
 
     void endSimulation();
 }

@@ -12,11 +12,14 @@
 #include <thrust/sort.h>
 #include <thrust/gather.h>
 #include <thrust/device_ptr.h>
+#include <thrust/execution_policy.h>
 #include <thrust/iterator/counting_iterator.h>
 #include <thrust/random.h>
 #include <cub/cub.cuh>
 
 #include <glm/glm.hpp>
+
+void deleteThreadPool();
 
 #ifndef imax
 #define imax( a, b ) ( ((a) > (b)) ? (a) : (b) )
@@ -101,6 +104,9 @@ glm::vec3 *dev_vel2;
 uint32_t *dev_boidIds;
 uint32_t *dev_boidIds2;
 
+glm::vec3 *dev_pos_snapshot;
+uint32_t *dev_boidIds_snapshot;
+
 int *dev_particleArrayIndices;
 int *dev_particleGridIndices;
 thrust::device_ptr<int> dev_thrust_particleArrayIndices;
@@ -120,6 +126,9 @@ int gridSideCount;
 float gridCellWidth;
 float gridInverseCellWidth;
 glm::vec3 gridMinimum;
+
+cudaStream_t simulation_stream;
+cudaEvent_t simulationSnapshotReadyEvent;
 
 /******************
 * initSimulation *
@@ -182,6 +191,9 @@ void Boids::initSimulation(int N) {
   numObjects = N;
   dim3 fullBlocksPerGrid((N + blockSize - 1) / blockSize);
 
+  cudaStreamCreate(&simulation_stream);
+  cudaEventCreateWithFlags(&simulationSnapshotReadyEvent, cudaEventDisableTiming);
+
   cudaMalloc((void**)&dev_pos, N * sizeof(glm::vec3));
   checkCUDAErrorWithLine("cudaMalloc dev_pos failed!");
 
@@ -198,21 +210,25 @@ void Boids::initSimulation(int N) {
   checkCUDAErrorWithLine("cudaMalloc dev_boidIds failed!");
   cudaMalloc((void**)&dev_boidIds2, N * sizeof(uint32_t));
   checkCUDAErrorWithLine("cudaMalloc dev_boidIds2 failed!");
-  kernInitializeBoidIds<<<fullBlocksPerGrid, blockSize>>>(N, dev_boidIds);
+  cudaMalloc((void**)&dev_pos_snapshot, N * sizeof(glm::vec3));
+  checkCUDAErrorWithLine("cudaMalloc dev_pos_snapshot failed!");
+  cudaMalloc((void**)&dev_boidIds_snapshot, N * sizeof(uint32_t));
+  checkCUDAErrorWithLine("cudaMalloc dev_boidIds_snapshot failed!");
+  kernInitializeBoidIds<<<fullBlocksPerGrid, blockSize, 0, simulation_stream>>>(N, dev_boidIds);
   checkCUDAErrorWithLine("kernInitializeBoidIds failed!");
 
   // Initialize velocity to random values
-  cudaMemset(dev_vel1, 0, N * sizeof(glm::vec3));
+  cudaMemsetAsync(dev_vel1, 0, N * sizeof(glm::vec3), simulation_stream);
   checkCUDAErrorWithLine("cudaMemset dev_vel1 failed!");
 
-  kernGenerateRandomPosArray<<<fullBlocksPerGrid, blockSize>>>(1, numObjects,
+  kernGenerateRandomPosArray<<<fullBlocksPerGrid, blockSize, 0, simulation_stream>>>(1, numObjects,
     dev_vel1, maxSpeed);
   checkCUDAErrorWithLine("kernGenerateRandomPosArray failed!");
 
-  cudaMemset(dev_vel2, 0, N * sizeof(glm::vec3));
+  cudaMemsetAsync(dev_vel2, 0, N * sizeof(glm::vec3), simulation_stream);
   checkCUDAErrorWithLine("cudaMemset dev_vel2 failed!");
 
-  kernGenerateFlockPositions<<<fullBlocksPerGrid, blockSize>>>(1, numObjects, dev_pos);
+  kernGenerateFlockPositions<<<fullBlocksPerGrid, blockSize, 0, simulation_stream>>>(1, numObjects, dev_pos);
   checkCUDAErrorWithLine("kernGenerateFlockPositions failed!");
 
   gridCellWidth = 2.0f * std::max(std::max(rule1Distance, rule2Distance), rule3Distance);
@@ -249,7 +265,7 @@ void Boids::initSimulation(int N) {
   dev_thrust_boidIds = thrust::device_pointer_cast(dev_boidIds);
   dev_thrust_boidIds2 = thrust::device_pointer_cast(dev_boidIds2);
 
-  cudaDeviceSynchronize();
+  cudaStreamSynchronize(simulation_stream);
 }
 
 
@@ -290,12 +306,12 @@ __global__ void kernCopyVelocitiesToVBO(int N, glm::vec3 *vel, float *vbo, float
 void Boids::copyBoidsToVBO(float *vbodptr_positions, float *vbodptr_velocities) {
   dim3 fullBlocksPerGrid((numObjects + blockSize - 1) / blockSize);
 
-  kernCopyPositionsToVBO << <fullBlocksPerGrid, blockSize >> >(numObjects, dev_pos, vbodptr_positions, scene_scale);
-  kernCopyVelocitiesToVBO << <fullBlocksPerGrid, blockSize >> >(numObjects, dev_vel1, vbodptr_velocities, scene_scale);
+  kernCopyPositionsToVBO<<<fullBlocksPerGrid, blockSize, 0, simulation_stream>>>(numObjects, dev_pos, vbodptr_positions, scene_scale);
+  kernCopyVelocitiesToVBO<<<fullBlocksPerGrid, blockSize, 0, simulation_stream>>>(numObjects, dev_vel1, vbodptr_velocities, scene_scale);
 
   checkCUDAErrorWithLine("copyBoidsToVBO failed!");
 
-  cudaDeviceSynchronize();
+  cudaStreamSynchronize(simulation_stream);
 }
 
 
@@ -496,25 +512,30 @@ void Boids::stepSimulationCoherentGrid(float dt) {
 
     dim3 fullBlocksPerGridGrid((gridCellCount + blockSize - 1) / blockSize);
 
-    kernResetIntBuffer<<<fullBlocksPerGridGrid, blockSize>>>(gridCellCount, dev_gridCellStartIndices, -1);
+    kernResetIntBuffer<<<fullBlocksPerGridGrid, blockSize, 0, simulation_stream>>>(gridCellCount, dev_gridCellStartIndices, -1);
     checkCUDAErrorWithLine("kernResetIntBuffer failed!");
 
-    kernResetIntBuffer<<<fullBlocksPerGridGrid, blockSize>>>(gridCellCount, dev_gridCellEndIndices, -1);
+    kernResetIntBuffer<<<fullBlocksPerGridGrid, blockSize, 0, simulation_stream>>>(gridCellCount, dev_gridCellEndIndices, -1);
     checkCUDAErrorWithLine("kernResetIntBuffer failed!");
 
-    kernComputeIndices<<<fullBlocksPerGrid, blockSize>>>(numObjects, gridResolution,
+    kernComputeIndices<<<fullBlocksPerGrid, blockSize, 0, simulation_stream>>>(numObjects, gridResolution,
       gridMinimum, gridInverseCellWidth, dev_pos, dev_particleArrayIndices, dev_particleGridIndices);
     checkCUDAErrorWithLine("kernComputeIndices failed!");
 
-    thrust::sort_by_key(dev_thrust_particleGridIndices, dev_thrust_particleGridIndices + numObjects, dev_thrust_particleArrayIndices);
+    thrust::sort_by_key(thrust::cuda::par_nosync.on(simulation_stream),
+      dev_thrust_particleGridIndices, dev_thrust_particleGridIndices + numObjects,
+      dev_thrust_particleArrayIndices);
 
-    kernIdentifyCellStartEnd<<<fullBlocksPerGrid, blockSize>>>(numObjects, dev_particleGridIndices, dev_gridCellStartIndices, dev_gridCellEndIndices);
+    kernIdentifyCellStartEnd<<<fullBlocksPerGrid, blockSize, 0, simulation_stream>>>(numObjects, dev_particleGridIndices, dev_gridCellStartIndices, dev_gridCellEndIndices);
     checkCUDAErrorWithLine("kernIdentifyCellStartEnd failed!");
 
     // Reorder particle data into sorted grid-cell order.
-    thrust::gather(dev_thrust_particleArrayIndices, dev_thrust_particleArrayIndices + numObjects, dev_thrust_pos, dev_thrust_pos2);
-    thrust::gather(dev_thrust_particleArrayIndices, dev_thrust_particleArrayIndices + numObjects, dev_thrust_vel1, dev_thrust_vel2);
-    thrust::gather(dev_thrust_particleArrayIndices, dev_thrust_particleArrayIndices + numObjects,
+    thrust::gather(thrust::cuda::par_nosync.on(simulation_stream),
+      dev_thrust_particleArrayIndices, dev_thrust_particleArrayIndices + numObjects, dev_thrust_pos, dev_thrust_pos2);
+    thrust::gather(thrust::cuda::par_nosync.on(simulation_stream),
+      dev_thrust_particleArrayIndices, dev_thrust_particleArrayIndices + numObjects, dev_thrust_vel1, dev_thrust_vel2);
+    thrust::gather(thrust::cuda::par_nosync.on(simulation_stream),
+      dev_thrust_particleArrayIndices, dev_thrust_particleArrayIndices + numObjects,
       dev_thrust_boidIds, dev_thrust_boidIds2);
 
     glm::vec3 *tempPos = dev_pos;
@@ -541,7 +562,7 @@ void Boids::stepSimulationCoherentGrid(float dt) {
     dev_thrust_vel1 = dev_thrust_vel2;
     dev_thrust_vel2 = tempThrustVel;
 
-    kernUpdateVelNeighborSearchCoherent<<<fullBlocksPerGrid, blockSize>>>(numObjects, gridResolution, gridMinimum, gridInverseCellWidth, dev_gridCellStartIndices, dev_gridCellEndIndices, dev_pos, dev_vel1, dev_vel2);
+    kernUpdateVelNeighborSearchCoherent<<<fullBlocksPerGrid, blockSize, 0, simulation_stream>>>(numObjects, gridResolution, gridMinimum, gridInverseCellWidth, dev_gridCellStartIndices, dev_gridCellEndIndices, dev_pos, dev_vel1, dev_vel2);
     checkCUDAErrorWithLine("kernUpdateVelNeighborSearchCoherent failed!");
 
     tempVel = dev_vel1;
@@ -552,20 +573,30 @@ void Boids::stepSimulationCoherentGrid(float dt) {
     dev_thrust_vel1 = dev_thrust_vel2;
     dev_thrust_vel2 = tempThrustVel;
 
-    kernUpdatePos<<<fullBlocksPerGrid, blockSize>>>(numObjects, dt, dev_pos, dev_vel1);
+    kernUpdatePos<<<fullBlocksPerGrid, blockSize, 0, simulation_stream>>>(numObjects, dt, dev_pos, dev_vel1);
     checkCUDAErrorWithLine("kernUpdatePos failed!");
   
-    cudaDeviceSynchronize();
+    cudaStreamSynchronize(simulation_stream);
 }
 
+void Boids::prepareSimulationSnapshotsForNetwork() {
+    cudaMemcpyAsync(dev_pos_snapshot, dev_pos, numObjects * sizeof(glm::vec3),
+      cudaMemcpyDeviceToDevice, simulation_stream);
+    cudaMemcpyAsync(dev_boidIds_snapshot, dev_boidIds, numObjects * sizeof(uint32_t),
+      cudaMemcpyDeviceToDevice, simulation_stream);
+    cudaEventRecord(simulationSnapshotReadyEvent, simulation_stream);
+}
 
 void releaseNetworkBuffers();
 
 void Boids::endSimulation() {
+  deleteThreadPool();
   cudaFree(dev_vel1);
   cudaFree(dev_vel2);
   cudaFree(dev_boidIds);
   cudaFree(dev_boidIds2);
+  cudaFree(dev_pos_snapshot);
+  cudaFree(dev_boidIds_snapshot);
   cudaFree(dev_pos);
   cudaFree(dev_pos2);
   cudaFree(dev_particleArrayIndices);
@@ -573,4 +604,6 @@ void Boids::endSimulation() {
   cudaFree(dev_gridCellStartIndices);
   cudaFree(dev_gridCellEndIndices);
   releaseNetworkBuffers();
+  cudaStreamDestroy(simulation_stream);
+  cudaEventDestroy(simulationSnapshotReadyEvent);
 }
