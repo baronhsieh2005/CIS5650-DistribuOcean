@@ -415,19 +415,23 @@ __device__ void calculateNeighborVelChangeCoherent(int cellX, int cellY, int cel
       continue;
     }
 
+    const glm::vec3 neighborPos = pos[neighborBoid];
+    const glm::vec3 neighborOffset = neighborPos - boidPos;
+    const float distanceSquared = glm::dot(neighborOffset, neighborOffset);
+
     // rule 1
-    if (glm::distance(boidPos, pos[neighborBoid]) < rule1Distance) {
-      perceived_center += pos[neighborBoid];
+    if (distanceSquared < rule1Distance * rule1Distance) {
+      perceived_center += neighborPos;
       num_neighbors_r1++;
     }
 
     // rule 2
-    if (glm::distance(boidPos, pos[neighborBoid]) < rule2Distance) {
-      c -= (pos[neighborBoid] - boidPos);
+    if (distanceSquared < rule2Distance * rule2Distance) {
+      c -= neighborOffset;
     }
 
     // rule 3
-    if (glm::distance(boidPos, pos[neighborBoid]) < rule3Distance) {
+    if (distanceSquared < rule3Distance * rule3Distance) {
       perceived_velocity += vel1[neighborBoid];
       num_neighbors_r3++;
     }
