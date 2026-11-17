@@ -1,10 +1,9 @@
 #pragma once
 
-#include <condition_variable>
 #include <cstdint>
 #include <glm/glm.hpp>
-#include <mutex>
 #include <atomic>
+#include <semaphore>
 
 #ifndef DEBUG_MODE
 #define DEBUG_MODE 1
@@ -68,13 +67,13 @@ namespace Boids {
 
     void endSimulation();
 
-    inline std::mutex ready_create_network_packet_lock;
-    inline std::condition_variable create_network_packet_cv;
-    inline bool ready_create_network_packet = false;
+    inline std::binary_semaphore ready_create_network_packet_semaphore{0};
+    inline std::atomic<bool> network_packet_request_outstanding{false};
     inline bool stop_network_packet_creation_loop = false;
     inline std::atomic<uint32_t> completedNetworkPackets{0};
     void requestNetworkPacket(const CameraCullData *cameras, bool *cameraChanged,
                               uint32_t phoneCount);
     void stopNetworkPacketCreationLoop();
     void networkPacketCreationLoop();
+    void phoneNetworkSendLoop(int phone_idx);
 }

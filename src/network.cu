@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdio>
 #include <memory>
+#include <thread>
 #include <vector>
 
 #include <thrust/sort.h>
@@ -85,6 +86,16 @@ std::vector<uint8_t *> hostNewBoidFlagsByPhone;
 std::vector<uint32_t *> hostFreeSlotsByPhone;
 std::vector<uint32_t *> hostNewRanksByPhone;
 
+std::vector<std::unique_ptr<std::binary_semaphore>> phone_packet_ready_semaphore;
+std::vector<std::thread> phone_packet_send_threads;
+bool stop_phone_packet_send_loop = false;
+Boids::UpdateBoidData **host_phone_update_packets = nullptr;
+Boids::NewBoidData **host_phone_new_packets = nullptr;
+uint32_t *host_phone_update_payload_lengths = nullptr;
+uint32_t *host_phone_new_payload_lengths = nullptr;
+cudaEvent_t phone_packet_sizes_ready_event = nullptr;
+std::vector<cudaEvent_t> phone_packet_copy_ready_events;
+
 std::vector<Boids::CameraCullData> queuedNetworkCameras;
 std::unique_ptr<bool[]> queuedNetworkCameraChanged;
 uint32_t queuedNetworkPhoneCount = 0;
@@ -143,6 +154,39 @@ __global__ void kernCullBoidsByCameras(uint32_t boidCount,
 void Boids::initializeNetworkPhones(const CameraCullData *cameras, uint32_t phoneCount) {
   if (network_stream == nullptr) {
     cudaStreamCreate(&network_stream);
+  }
+  if (!phone_packet_send_threads.empty()) {
+    stop_phone_packet_send_loop = true;
+    for (const auto &semaphore : phone_packet_ready_semaphore) {
+      semaphore->release();
+    }
+    for (std::thread &thread : phone_packet_send_threads) {
+      thread.join();
+    }
+    phone_packet_send_threads.clear();
+    phone_packet_ready_semaphore.clear();
+  }
+  for (cudaEvent_t event : phone_packet_copy_ready_events) {
+    cudaEventDestroy(event);
+  }
+  phone_packet_copy_ready_events.clear();
+  if (phone_packet_sizes_ready_event != nullptr) {
+    cudaEventDestroy(phone_packet_sizes_ready_event);
+    phone_packet_sizes_ready_event = nullptr;
+  }
+  if (host_phone_update_packets != nullptr) {
+    for (uint32_t phoneIndex = 0; phoneIndex < networkPhoneCount; ++phoneIndex) {
+      cudaFreeHost(host_phone_update_packets[phoneIndex]);
+      cudaFreeHost(host_phone_new_packets[phoneIndex]);
+    }
+    cudaFreeHost(host_phone_update_packets);
+    cudaFreeHost(host_phone_new_packets);
+    cudaFreeHost(host_phone_update_payload_lengths);
+    cudaFreeHost(host_phone_new_payload_lengths);
+    host_phone_update_packets = nullptr;
+    host_phone_new_packets = nullptr;
+    host_phone_update_payload_lengths = nullptr;
+    host_phone_new_payload_lengths = nullptr;
   }
   for (float *distanceBuffer : hostPhoneDistanceBuffers) {
     cudaFree(distanceBuffer);
@@ -251,6 +295,29 @@ void Boids::initializeNetworkPhones(const CameraCullData *cameras, uint32_t phon
   networkPhoneCount = phoneCount;
   if (phoneCount == 0) {
     return;
+  }
+
+  stop_phone_packet_send_loop = false;
+  phone_packet_ready_semaphore.reserve(phoneCount);
+  phone_packet_send_threads.reserve(phoneCount);
+  cudaMallocHost((void **)&host_phone_update_packets,
+    phoneCount * sizeof(Boids::UpdateBoidData *));
+  cudaMallocHost((void **)&host_phone_new_packets,
+    phoneCount * sizeof(Boids::NewBoidData *));
+  cudaMallocHost((void **)&host_phone_update_payload_lengths, phoneCount * sizeof(uint32_t));
+  cudaMallocHost((void **)&host_phone_new_payload_lengths, phoneCount * sizeof(uint32_t));
+  cudaEventCreateWithFlags(&phone_packet_sizes_ready_event, cudaEventDisableTiming);
+  phone_packet_copy_ready_events.resize(phoneCount);
+  for (uint32_t phoneIndex = 0; phoneIndex < phoneCount; ++phoneIndex) {
+    cudaMallocHost((void **)&host_phone_update_packets[phoneIndex],
+      MAX_BOIDS_PER_PHONE * sizeof(Boids::UpdateBoidData));
+    cudaMallocHost((void **)&host_phone_new_packets[phoneIndex],
+      MAX_BOIDS_PER_PHONE * sizeof(Boids::NewBoidData));
+    host_phone_update_payload_lengths[phoneIndex] = 0;
+    host_phone_new_payload_lengths[phoneIndex] = 0;
+    phone_packet_ready_semaphore.emplace_back(std::make_unique<std::binary_semaphore>(0));
+    cudaEventCreateWithFlags(&phone_packet_copy_ready_events[phoneIndex], cudaEventDisableTiming);
+    phone_packet_send_threads.emplace_back(Boids::phoneNetworkSendLoop, phoneIndex);
   }
 
   hostPhoneDistanceBuffers.resize(phoneCount);
@@ -722,6 +789,38 @@ Boids::NewBoidData* const* Boids::getDevicePhoneNewPayloads() {
 
 
 void releaseNetworkBuffers() {
+  stop_phone_packet_send_loop = true;
+  for (const auto &semaphore : phone_packet_ready_semaphore) {
+    semaphore->release();
+  }
+  for (std::thread &thread : phone_packet_send_threads) {
+    if (thread.joinable()) {
+      thread.join();
+    }
+  }
+  phone_packet_send_threads.clear();
+  phone_packet_ready_semaphore.clear();
+  for (uint32_t phoneIndex = 0; phoneIndex < networkPhoneCount; ++phoneIndex) {
+    if (host_phone_update_packets != nullptr) cudaFreeHost(host_phone_update_packets[phoneIndex]);
+    if (host_phone_new_packets != nullptr) cudaFreeHost(host_phone_new_packets[phoneIndex]);
+  }
+  if (host_phone_update_packets != nullptr) cudaFreeHost(host_phone_update_packets);
+  if (host_phone_new_packets != nullptr) cudaFreeHost(host_phone_new_packets);
+  if (host_phone_update_payload_lengths != nullptr) cudaFreeHost(host_phone_update_payload_lengths);
+  if (host_phone_new_payload_lengths != nullptr) cudaFreeHost(host_phone_new_payload_lengths);
+  host_phone_update_packets = nullptr;
+  host_phone_new_packets = nullptr;
+  host_phone_update_payload_lengths = nullptr;
+  host_phone_new_payload_lengths = nullptr;
+  for (cudaEvent_t event : phone_packet_copy_ready_events) {
+    cudaEventDestroy(event);
+  }
+  phone_packet_copy_ready_events.clear();
+  if (phone_packet_sizes_ready_event != nullptr) {
+    cudaEventDestroy(phone_packet_sizes_ready_event);
+    phone_packet_sizes_ready_event = nullptr;
+  }
+
   for (float *distanceBuffer : hostPhoneDistanceBuffers) {
     cudaFree(distanceBuffer);
   }
@@ -768,8 +867,9 @@ void releaseNetworkBuffers() {
 
 void Boids::requestNetworkPacket(const CameraCullData *cameras, bool *cameraChanged,
   uint32_t phoneCount) {
-  std::lock_guard<std::mutex> lock(ready_create_network_packet_lock);
-  if (ready_create_network_packet) {
+  bool expected = false;
+  if (!network_packet_request_outstanding.compare_exchange_strong(expected, true,
+      std::memory_order_acq_rel)) {
     return;
   }
 
@@ -781,14 +881,12 @@ void Boids::requestNetworkPacket(const CameraCullData *cameras, bool *cameraChan
     cameraChanged[phoneIndex] = false;
   }
   queuedNetworkPhoneCount = phoneCount;
-  ready_create_network_packet = true;
-  create_network_packet_cv.notify_one();
+  ready_create_network_packet_semaphore.release();
 }
 
 void Boids::stopNetworkPacketCreationLoop() {
-  std::lock_guard<std::mutex> lock(ready_create_network_packet_lock);
   stop_network_packet_creation_loop = true;
-  create_network_packet_cv.notify_one();
+  ready_create_network_packet_semaphore.release();
 }
 
 void Boids::networkPacketCreationLoop() {
@@ -797,10 +895,8 @@ void Boids::networkPacketCreationLoop() {
     std::unique_ptr<bool[]> cameraChanged;
     uint32_t phoneCount = 0;
 
-    std::unique_lock<std::mutex> lock(ready_create_network_packet_lock);
-    create_network_packet_cv.wait(lock, [] {
-      return ready_create_network_packet || stop_network_packet_creation_loop;
-    });
+    // wait until ready for next packet
+    ready_create_network_packet_semaphore.acquire();
     if (stop_network_packet_creation_loop) {
       return;
     }
@@ -808,15 +904,48 @@ void Boids::networkPacketCreationLoop() {
     cameras = std::move(queuedNetworkCameras);
     phoneCount = queuedNetworkPhoneCount;
     cameraChanged = std::move(queuedNetworkCameraChanged);
-    lock.unlock();
 
     cullBoidsByCameras(cameras.data(), cameraChanged.get(), phoneCount);
+    cudaMemcpyAsync(host_phone_update_payload_lengths, dev_phoneUpdatePayloadLengths,
+      phoneCount * sizeof(uint32_t), cudaMemcpyDeviceToHost, network_stream);
+    cudaMemcpyAsync(host_phone_new_payload_lengths, dev_phoneNewPayloadLengths,
+      phoneCount * sizeof(uint32_t), cudaMemcpyDeviceToHost, network_stream);
 #if DEBUG_MODE
     completedNetworkPackets.fetch_add(1, std::memory_order_relaxed);
 #endif
+    network_packet_request_outstanding.store(false, std::memory_order_release);
 
-    lock.lock();
-    ready_create_network_packet = false;
-    lock.unlock();
+    cudaEventRecord(phone_packet_sizes_ready_event, network_stream);
+    cudaEventSynchronize(phone_packet_sizes_ready_event);
+    for (uint32_t phone = 0; phone < phoneCount; phone++) {
+        phone_packet_ready_semaphore[phone]->release();
+    }
+  }
+}
+
+void Boids::phoneNetworkSendLoop(int phone_idx) {
+  while (!stop_phone_packet_send_loop) {
+    phone_packet_ready_semaphore[phone_idx]->acquire();
+    if (stop_phone_packet_send_loop) {
+      return;
+    }
+
+
+    const uint32_t updatePacketBytes = host_phone_update_payload_lengths[phone_idx];
+    const uint32_t newPacketBytes = host_phone_new_payload_lengths[phone_idx];
+    cudaMemcpyAsync(host_phone_update_packets[phone_idx], hostBoidUpdatePackets[phone_idx],
+        updatePacketBytes, cudaMemcpyDeviceToHost,
+        network_stream);
+    cudaMemcpyAsync(host_phone_new_packets[phone_idx], hostBoidNewPackets[phone_idx],
+        newPacketBytes, cudaMemcpyDeviceToHost,
+        network_stream);
+
+    cudaEventRecord(phone_packet_copy_ready_events[phone_idx], network_stream);
+    cudaEventSynchronize(phone_packet_copy_ready_events[phone_idx]);
+
+    Boids::UpdateBoidData *updatePacket = host_phone_update_packets[phone_idx];
+    Boids::NewBoidData *newPacket = host_phone_new_packets[phone_idx];
+
+    // actually send packets over network
   }
 }
