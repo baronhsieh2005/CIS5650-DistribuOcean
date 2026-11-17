@@ -3,6 +3,9 @@
 #include <cstdint>
 #include <glm/glm.hpp>
 #include <atomic>
+#include <latch>
+#include <memory>
+#include <mutex>
 #include <semaphore>
 
 #ifndef DEBUG_MODE
@@ -70,10 +73,14 @@ namespace Boids {
     inline std::binary_semaphore ready_create_network_packet_semaphore{0};
     inline std::atomic<bool> network_packet_request_outstanding{false};
     inline bool stop_network_packet_creation_loop = false;
+    inline bool ready_request_network_packet = false;
+    inline std::mutex ready_request_network_packet_lock;
+    inline std::unique_ptr<std::latch> network_data_done_sending_latch;
     inline std::atomic<uint32_t> completedNetworkPackets{0};
     void requestNetworkPacket(const CameraCullData *cameras, bool *cameraChanged,
                               uint32_t phoneCount);
     void stopNetworkPacketCreationLoop();
+    void stopPhoneNetworkSendLoops();
     void networkPacketCreationLoop();
     void phoneNetworkSendLoop(int phone_idx);
 }

@@ -42,6 +42,7 @@ int main(int argc, char* argv[]) {
 
   if (init(argc, argv)) {
     mainLoop();
+    Boids::stopPhoneNetworkSendLoops();
     Boids::stopNetworkPacketCreationLoop();
     network_packet_create_thread->join();
     Boids::endSimulation();
@@ -258,18 +259,19 @@ void initShaders(GLuint * program) {
 
     Boids::stepSimulationCoherentGrid(DT);
 
-    static double lastNetworkUpdateTime = -NETWORK_UPDATE_INTERVAL_SECONDS;
     const double currentTime = simulationClockSeconds();
 #if !VISUALIZE || DEBUG_MODE
     static double rateSampleStartTime = currentTime;
     static uint32_t stepsSinceRateSample = 0;
     ++stepsSinceRateSample;
 #endif
-    if (currentTime - lastNetworkUpdateTime >= NETWORK_UPDATE_INTERVAL_SECONDS) {
+    std::unique_lock<std::mutex> lock(Boids::ready_request_network_packet_lock);
+    if (Boids::ready_request_network_packet) {
+        Boids::ready_request_network_packet = false;
+        lock.unlock();
       Boids::requestNetworkPacket(networkCameras.data(), networkCameraChanged.get(),
         static_cast<uint32_t>(networkCameras.size()));
-      lastNetworkUpdateTime = currentTime;
-    } 
+    }
 
 #if !VISUALIZE || DEBUG_MODE
     const double rateSampleDuration = currentTime - rateSampleStartTime;

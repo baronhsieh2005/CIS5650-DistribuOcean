@@ -6,6 +6,7 @@
 #include "utilityCore.hpp"
 
 #include <cmath>
+#include <chrono>
 #include <cstdio>
 #include <memory>
 #include <thread>
@@ -94,7 +95,7 @@ Boids::NewBoidData **host_phone_new_packets = nullptr;
 uint32_t *host_phone_update_payload_lengths = nullptr;
 uint32_t *host_phone_new_payload_lengths = nullptr;
 cudaEvent_t phone_packet_sizes_ready_event = nullptr;
-std::vector<cudaEvent_t> phone_packet_copy_ready_events;
+cudaEvent_t phone_packet_payloads_ready_event = nullptr;
 
 std::vector<Boids::CameraCullData> queuedNetworkCameras;
 std::unique_ptr<bool[]> queuedNetworkCameraChanged;
@@ -166,13 +167,13 @@ void Boids::initializeNetworkPhones(const CameraCullData *cameras, uint32_t phon
     phone_packet_send_threads.clear();
     phone_packet_ready_semaphore.clear();
   }
-  for (cudaEvent_t event : phone_packet_copy_ready_events) {
-    cudaEventDestroy(event);
-  }
-  phone_packet_copy_ready_events.clear();
   if (phone_packet_sizes_ready_event != nullptr) {
     cudaEventDestroy(phone_packet_sizes_ready_event);
     phone_packet_sizes_ready_event = nullptr;
+  }
+  if (phone_packet_payloads_ready_event != nullptr) {
+    cudaEventDestroy(phone_packet_payloads_ready_event);
+    phone_packet_payloads_ready_event = nullptr;
   }
   if (host_phone_update_packets != nullptr) {
     for (uint32_t phoneIndex = 0; phoneIndex < networkPhoneCount; ++phoneIndex) {
@@ -298,6 +299,7 @@ void Boids::initializeNetworkPhones(const CameraCullData *cameras, uint32_t phon
   }
 
   stop_phone_packet_send_loop = false;
+  Boids::network_data_done_sending_latch = nullptr;
   phone_packet_ready_semaphore.reserve(phoneCount);
   phone_packet_send_threads.reserve(phoneCount);
   cudaMallocHost((void **)&host_phone_update_packets,
@@ -307,7 +309,7 @@ void Boids::initializeNetworkPhones(const CameraCullData *cameras, uint32_t phon
   cudaMallocHost((void **)&host_phone_update_payload_lengths, phoneCount * sizeof(uint32_t));
   cudaMallocHost((void **)&host_phone_new_payload_lengths, phoneCount * sizeof(uint32_t));
   cudaEventCreateWithFlags(&phone_packet_sizes_ready_event, cudaEventDisableTiming);
-  phone_packet_copy_ready_events.resize(phoneCount);
+  cudaEventCreateWithFlags(&phone_packet_payloads_ready_event, cudaEventDisableTiming);
   for (uint32_t phoneIndex = 0; phoneIndex < phoneCount; ++phoneIndex) {
     cudaMallocHost((void **)&host_phone_update_packets[phoneIndex],
       MAX_BOIDS_PER_PHONE * sizeof(Boids::UpdateBoidData));
@@ -316,7 +318,6 @@ void Boids::initializeNetworkPhones(const CameraCullData *cameras, uint32_t phon
     host_phone_update_payload_lengths[phoneIndex] = 0;
     host_phone_new_payload_lengths[phoneIndex] = 0;
     phone_packet_ready_semaphore.emplace_back(std::make_unique<std::binary_semaphore>(0));
-    cudaEventCreateWithFlags(&phone_packet_copy_ready_events[phoneIndex], cudaEventDisableTiming);
     phone_packet_send_threads.emplace_back(Boids::phoneNetworkSendLoop, phoneIndex);
   }
 
@@ -789,10 +790,7 @@ Boids::NewBoidData* const* Boids::getDevicePhoneNewPayloads() {
 
 
 void releaseNetworkBuffers() {
-  stop_phone_packet_send_loop = true;
-  for (const auto &semaphore : phone_packet_ready_semaphore) {
-    semaphore->release();
-  }
+  Boids::stopPhoneNetworkSendLoops();
   for (std::thread &thread : phone_packet_send_threads) {
     if (thread.joinable()) {
       thread.join();
@@ -812,13 +810,13 @@ void releaseNetworkBuffers() {
   host_phone_new_packets = nullptr;
   host_phone_update_payload_lengths = nullptr;
   host_phone_new_payload_lengths = nullptr;
-  for (cudaEvent_t event : phone_packet_copy_ready_events) {
-    cudaEventDestroy(event);
-  }
-  phone_packet_copy_ready_events.clear();
   if (phone_packet_sizes_ready_event != nullptr) {
     cudaEventDestroy(phone_packet_sizes_ready_event);
     phone_packet_sizes_ready_event = nullptr;
+  }
+  if (phone_packet_payloads_ready_event != nullptr) {
+    cudaEventDestroy(phone_packet_payloads_ready_event);
+    phone_packet_payloads_ready_event = nullptr;
   }
 
   for (float *distanceBuffer : hostPhoneDistanceBuffers) {
@@ -889,6 +887,13 @@ void Boids::stopNetworkPacketCreationLoop() {
   ready_create_network_packet_semaphore.release();
 }
 
+void Boids::stopPhoneNetworkSendLoops() {
+  stop_phone_packet_send_loop = true;
+  for (const auto &semaphore : phone_packet_ready_semaphore) {
+    semaphore->release();
+  }
+}
+
 void Boids::networkPacketCreationLoop() {
   while (true) {
     std::vector<CameraCullData> cameras;
@@ -896,6 +901,10 @@ void Boids::networkPacketCreationLoop() {
     uint32_t phoneCount = 0;
 
     // wait until ready for next packet
+    {
+        std::lock_guard<std::mutex> lock(ready_request_network_packet_lock);
+        ready_request_network_packet = true;
+    }
     ready_create_network_packet_semaphore.acquire();
     if (stop_network_packet_creation_loop) {
       return;
@@ -906,6 +915,9 @@ void Boids::networkPacketCreationLoop() {
     cameraChanged = std::move(queuedNetworkCameraChanged);
 
     cullBoidsByCameras(cameras.data(), cameraChanged.get(), phoneCount);
+    if (stop_network_packet_creation_loop) {
+      return;
+    }
     cudaMemcpyAsync(host_phone_update_payload_lengths, dev_phoneUpdatePayloadLengths,
       phoneCount * sizeof(uint32_t), cudaMemcpyDeviceToHost, network_stream);
     cudaMemcpyAsync(host_phone_new_payload_lengths, dev_phoneNewPayloadLengths,
@@ -915,8 +927,28 @@ void Boids::networkPacketCreationLoop() {
 #endif
     network_packet_request_outstanding.store(false, std::memory_order_release);
 
+    // Wait for the prior packet to finish sending before reusing host packet buffers.
+    if (network_data_done_sending_latch != nullptr) {
+      network_data_done_sending_latch->wait();
+      if (stop_network_packet_creation_loop) {
+        return;
+      }
+    }
+    network_data_done_sending_latch = std::make_unique<std::latch>(phoneCount);
+
     cudaEventRecord(phone_packet_sizes_ready_event, network_stream);
     cudaEventSynchronize(phone_packet_sizes_ready_event);
+    for (uint32_t phone = 0; phone < phoneCount; ++phone) {
+      cudaMemcpyAsync(host_phone_update_packets[phone], hostBoidUpdatePackets[phone],
+        host_phone_update_payload_lengths[phone] * sizeof(uint8_t), cudaMemcpyDeviceToHost,
+        network_stream);
+      cudaMemcpyAsync(host_phone_new_packets[phone], hostBoidNewPackets[phone],
+        host_phone_new_payload_lengths[phone] * sizeof(uint8_t), cudaMemcpyDeviceToHost,
+        network_stream);
+    }
+    cudaEventRecord(phone_packet_payloads_ready_event, network_stream);
+    cudaEventSynchronize(phone_packet_payloads_ready_event);
+
     for (uint32_t phone = 0; phone < phoneCount; phone++) {
         phone_packet_ready_semaphore[phone]->release();
     }
@@ -927,25 +959,21 @@ void Boids::phoneNetworkSendLoop(int phone_idx) {
   while (!stop_phone_packet_send_loop) {
     phone_packet_ready_semaphore[phone_idx]->acquire();
     if (stop_phone_packet_send_loop) {
+      if (network_data_done_sending_latch != nullptr) {
+        network_data_done_sending_latch->count_down();
+      }
       return;
     }
 
-
-    const uint32_t updatePacketBytes = host_phone_update_payload_lengths[phone_idx];
-    const uint32_t newPacketBytes = host_phone_new_payload_lengths[phone_idx];
-    cudaMemcpyAsync(host_phone_update_packets[phone_idx], hostBoidUpdatePackets[phone_idx],
-        updatePacketBytes, cudaMemcpyDeviceToHost,
-        network_stream);
-    cudaMemcpyAsync(host_phone_new_packets[phone_idx], hostBoidNewPackets[phone_idx],
-        newPacketBytes, cudaMemcpyDeviceToHost,
-        network_stream);
-
-    cudaEventRecord(phone_packet_copy_ready_events[phone_idx], network_stream);
-    cudaEventSynchronize(phone_packet_copy_ready_events[phone_idx]);
-
     Boids::UpdateBoidData *updatePacket = host_phone_update_packets[phone_idx];
     Boids::NewBoidData *newPacket = host_phone_new_packets[phone_idx];
+    const uint32_t updatePacketBytes = host_phone_update_payload_lengths[phone_idx];
+    const uint32_t newPacketBytes = host_phone_new_payload_lengths[phone_idx];
 
     // actually send packets over network
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    
+    // notify network thread that this one is done
+    network_data_done_sending_latch->count_down();
   }
 }
