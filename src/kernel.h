@@ -1,7 +1,10 @@
 #pragma once
 
+#include <condition_variable>
 #include <cstdint>
 #include <glm/glm.hpp>
+#include <mutex>
+#include <atomic>
 
 #ifndef DEBUG_MODE
 #define DEBUG_MODE 1
@@ -64,4 +67,14 @@ namespace Boids {
     void prepareSimulationSnapshotsForNetwork();
 
     void endSimulation();
+
+    inline std::mutex ready_create_network_packet_lock;
+    inline std::condition_variable create_network_packet_cv;
+    inline bool ready_create_network_packet = false;
+    inline bool stop_network_packet_creation_loop = false;
+    inline std::atomic<uint32_t> completedNetworkPackets{0};
+    void requestNetworkPacket(const CameraCullData *cameras, bool *cameraChanged,
+                              uint32_t phoneCount);
+    void stopNetworkPacketCreationLoop();
+    void networkPacketCreationLoop();
 }

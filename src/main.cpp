@@ -14,12 +14,11 @@
 #include <iostream>
 #include <memory>
 #include <sstream>
+#include <thread>
 
 #include <cuda_runtime.h>
 #include <cuda_gl_interop.h>
 #include <glm/gtc/matrix_transform.hpp>
-
-#include "threadpool.hpp"
 
 // ================
 // Configuration
@@ -33,6 +32,8 @@ const float DT = 0.2f;
 #endif
 const double NETWORK_UPDATE_INTERVAL_SECONDS = 1.0 / 20.0;
 
+std::unique_ptr<std::thread> network_packet_create_thread;
+
 /**
 * C main function.
 */
@@ -41,6 +42,8 @@ int main(int argc, char* argv[]) {
 
   if (init(argc, argv)) {
     mainLoop();
+    Boids::stopNetworkPacketCreationLoop();
+    network_packet_create_thread->join();
     Boids::endSimulation();
     return 0;
   } else {
@@ -54,10 +57,6 @@ int main(int argc, char* argv[]) {
 
 std::string deviceName;
 GLFWwindow *window;
-static ThreadPool *thd_pool;
-#if DEBUG_MODE
-static std::atomic<uint32_t> completedNetworkPackets{0};
-#endif
 
 double simulationClockSeconds() {
 #if VISUALIZE
@@ -93,8 +92,7 @@ bool init(int argc, char **argv) {
   ss << projectName << " [SM " << major << "." << minor << " " << deviceProp.name << "]";
   deviceName = ss.str();
 
-  // Setup threadpool
-  thd_pool = new ThreadPool(std::thread::hardware_concurrency()-1);
+  network_packet_create_thread = std::make_unique<std::thread>(Boids::networkPacketCreationLoop);
 
   // Rendering setup is not needed in compute-only mode.
 #if VISUALIZE
@@ -149,14 +147,12 @@ bool init(int argc, char **argv) {
 
   networkCameras.resize(cameras.size());
   networkCameraChanged = std::make_unique<bool[]>(cameras.size());
-  networkCameraChangedSnapshot = std::make_unique<bool[]>(cameras.size());
   for (std::size_t cameraIndex = 0; cameraIndex < cameras.size(); ++cameraIndex) {
     networkCameras[cameraIndex] = {
       cameras[cameraIndex].getPosition(),
       cameras[cameraIndex].getProjMat(),
     };
     networkCameraChanged[cameraIndex] = false;
-    networkCameraChangedSnapshot[cameraIndex] = false;
   }
   Boids::initializeNetworkPhones(networkCameras.data(),
     static_cast<uint32_t>(networkCameras.size()));
@@ -270,21 +266,8 @@ void initShaders(GLuint * program) {
     ++stepsSinceRateSample;
 #endif
     if (currentTime - lastNetworkUpdateTime >= NETWORK_UPDATE_INTERVAL_SECONDS) {
-      Boids::prepareSimulationSnapshotsForNetwork();
-
-      for (std::size_t cameraIndex = 0; cameraIndex < networkCameras.size(); ++cameraIndex) {
-        networkCameraChangedSnapshot[cameraIndex] = networkCameraChanged[cameraIndex];
-        networkCameraChanged[cameraIndex] = false;
-      }
-
-      getThreadPool()->AddTask([cameras = networkCameras,
-        cameraChanged = networkCameraChangedSnapshot.get()]() {
-        Boids::cullBoidsByCameras(cameras.data(), cameraChanged,
-          static_cast<uint32_t>(cameras.size()));
-#if DEBUG_MODE
-        completedNetworkPackets.fetch_add(1, std::memory_order_relaxed);
-#endif
-      });
+      Boids::requestNetworkPacket(networkCameras.data(), networkCameraChanged.get(),
+        static_cast<uint32_t>(networkCameras.size()));
       lastNetworkUpdateTime = currentTime;
     } 
 
@@ -294,7 +277,7 @@ void initShaders(GLuint * program) {
       printf("%.1f simulation steps/s", stepsSinceRateSample / rateSampleDuration);
 #if DEBUG_MODE
       static uint32_t previouslyCompletedNetworkPackets = 0;
-      const uint32_t completedPackets = completedNetworkPackets.load(std::memory_order_relaxed);
+      const uint32_t completedPackets = Boids::completedNetworkPackets.load(std::memory_order_relaxed);
       const uint32_t packetsSinceRateSample = completedPackets - previouslyCompletedNetworkPackets;
       printf(" | %u packet builds completed (%.1f packets/s)", packetsSinceRateSample,
         packetsSinceRateSample / rateSampleDuration);
@@ -575,12 +558,3 @@ void initShaders(GLuint * program) {
     };
     networkCameraChanged[cameraIndex] = true;
   }
-
-ThreadPool *getThreadPool() {
-    return thd_pool;
-}
-
-void deleteThreadPool() {
-    thd_pool->Stop();
-    delete thd_pool;
-}

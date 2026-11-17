@@ -19,8 +19,6 @@
 
 #include <glm/glm.hpp>
 
-void deleteThreadPool();
-
 #ifndef imax
 #define imax( a, b ) ( ((a) > (b)) ? (a) : (b) )
 #endif
@@ -590,7 +588,6 @@ void Boids::prepareSimulationSnapshotsForNetwork() {
 void releaseNetworkBuffers();
 
 void Boids::endSimulation() {
-  deleteThreadPool();
   cudaFree(dev_vel1);
   cudaFree(dev_vel2);
   cudaFree(dev_boidIds);

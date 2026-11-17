@@ -7,6 +7,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <memory>
 #include <vector>
 
 #include <thrust/sort.h>
@@ -83,6 +84,10 @@ std::vector<uint8_t *> hostFreeSlotFlagsByPhone;
 std::vector<uint8_t *> hostNewBoidFlagsByPhone;
 std::vector<uint32_t *> hostFreeSlotsByPhone;
 std::vector<uint32_t *> hostNewRanksByPhone;
+
+std::vector<Boids::CameraCullData> queuedNetworkCameras;
+std::unique_ptr<bool[]> queuedNetworkCameraChanged;
+uint32_t queuedNetworkPhoneCount = 0;
 
 __device__ bool isInsideCameraFrustum(const glm::vec3 &position,
   const Boids::CameraCullData &camera, float tolerance) {
@@ -757,5 +762,61 @@ void releaseNetworkBuffers() {
   if (network_stream != nullptr) {
     cudaStreamDestroy(network_stream);
     network_stream = nullptr;
+  }
+
+}
+
+void Boids::requestNetworkPacket(const CameraCullData *cameras, bool *cameraChanged,
+  uint32_t phoneCount) {
+  std::lock_guard<std::mutex> lock(ready_create_network_packet_lock);
+  if (ready_create_network_packet) {
+    return;
+  }
+
+  prepareSimulationSnapshotsForNetwork();
+  queuedNetworkCameras.assign(cameras, cameras + phoneCount);
+  queuedNetworkCameraChanged = std::make_unique<bool[]>(phoneCount);
+  for (uint32_t phoneIndex = 0; phoneIndex < phoneCount; ++phoneIndex) {
+    queuedNetworkCameraChanged[phoneIndex] = cameraChanged[phoneIndex];
+    cameraChanged[phoneIndex] = false;
+  }
+  queuedNetworkPhoneCount = phoneCount;
+  ready_create_network_packet = true;
+  create_network_packet_cv.notify_one();
+}
+
+void Boids::stopNetworkPacketCreationLoop() {
+  std::lock_guard<std::mutex> lock(ready_create_network_packet_lock);
+  stop_network_packet_creation_loop = true;
+  create_network_packet_cv.notify_one();
+}
+
+void Boids::networkPacketCreationLoop() {
+  while (true) {
+    std::vector<CameraCullData> cameras;
+    std::unique_ptr<bool[]> cameraChanged;
+    uint32_t phoneCount = 0;
+
+    std::unique_lock<std::mutex> lock(ready_create_network_packet_lock);
+    create_network_packet_cv.wait(lock, [] {
+      return ready_create_network_packet || stop_network_packet_creation_loop;
+    });
+    if (stop_network_packet_creation_loop) {
+      return;
+    }
+
+    cameras = std::move(queuedNetworkCameras);
+    phoneCount = queuedNetworkPhoneCount;
+    cameraChanged = std::move(queuedNetworkCameraChanged);
+    lock.unlock();
+
+    cullBoidsByCameras(cameras.data(), cameraChanged.get(), phoneCount);
+#if DEBUG_MODE
+    completedNetworkPackets.fetch_add(1, std::memory_order_relaxed);
+#endif
+
+    lock.lock();
+    ready_create_network_packet = false;
+    lock.unlock();
   }
 }
