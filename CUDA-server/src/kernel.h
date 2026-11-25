@@ -13,6 +13,11 @@
 #define DEBUG_PACKET_LENGTHS 0
 #endif
 
+// Set to 1 only when profiling individual network packet pipeline stages.
+#ifndef DEBUG_NETWORK_PIPELINE_TIMINGS
+#define DEBUG_NETWORK_PIPELINE_TIMINGS 1
+#endif
+
 namespace Boids {
     constexpr float cullDistance = 900.0f;
     constexpr uint16_t NEW_BOID_POLAR_ENCODING_BIT = 0x8000u;

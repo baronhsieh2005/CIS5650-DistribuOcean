@@ -48,11 +48,7 @@ bool rightMousePressed = false;
 
 int currCamera = 0;
 bool useGlobalCamera = false;
-std::vector<Camera> cameras = {
-    Camera(-0.70f, 1.22f, 45.0f, glm::vec3(-75.0f, -30.0f, 0.0f)),
-    Camera(0.70f, 1.10f, 45.0f, glm::vec3(75.0f, -30.0f, 0.0f)),
-    Camera(2.10f, 1.45f, 45.0f, glm::vec3(0.0f, 75.0f, 0.0f)),
-};
+std::vector<Camera> cameras;
 std::vector<Boids::CameraCullData> networkCameras;
 std::unique_ptr<bool[]> networkCameraChanged;
 GlobalCamera globalCamera;
@@ -81,6 +77,7 @@ void updateGlobalCamera();
 void updateCameraIcons();
 void updateActiveCameraUniform();
 void updateNetworkCamera(std::size_t cameraIndex);
+void initializeVirtualCameras();
 void runCUDA();
 
 //====================================

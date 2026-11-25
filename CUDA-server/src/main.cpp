@@ -13,6 +13,7 @@
 #include <chrono>
 #include <iostream>
 #include <memory>
+#include <random>
 #include <sstream>
 #include <thread>
 
@@ -27,6 +28,10 @@
 
 const int N_FOR_VIS = 40000;
 const float DT = 0.2f;
+// Change this to control how many virtual phone cameras are tested.
+const uint32_t NUM_VIRTUAL_CAMERAS = 100;
+const float VIRTUAL_CAMERA_POSITION_EXTENT = 240.0f;
+const uint32_t VIRTUAL_CAMERA_RANDOM_SEED = 5650;
 #ifndef VISUALIZE
 #define VISUALIZE 0
 #endif
@@ -69,6 +74,33 @@ double simulationClockSeconds() {
 #endif
 }
 
+void initializeVirtualCameras() {
+  std::mt19937 random(VIRTUAL_CAMERA_RANDOM_SEED);
+  std::uniform_real_distribution<float> positionDistribution(
+    -VIRTUAL_CAMERA_POSITION_EXTENT, VIRTUAL_CAMERA_POSITION_EXTENT);
+  std::uniform_real_distribution<float> azimuthDistribution(0.0f, 2.0f * PI);
+  std::uniform_real_distribution<float> verticalDistribution(-1.0f, 1.0f);
+
+  cameras.clear();
+  cameras.reserve(NUM_VIRTUAL_CAMERAS);
+  for (uint32_t cameraIndex = 0; cameraIndex < NUM_VIRTUAL_CAMERAS; ++cameraIndex) {
+    const glm::vec3 position(positionDistribution(random), positionDistribution(random),
+      positionDistribution(random));
+    const float azimuth = azimuthDistribution(random);
+    const float vertical = verticalDistribution(random);
+    const float horizontal = std::sqrt(1.0f - vertical * vertical);
+    const glm::vec3 forward(horizontal * std::cos(azimuth), horizontal * std::sin(azimuth), vertical);
+
+    // Camera's constructor places it at lookAt + sphericalOffset.  Pick a
+    // one-unit offset opposite its desired forward direction, so the camera
+    // starts exactly at the sampled position and looks in the sampled direction.
+    const glm::vec3 offset = -forward;
+    const float theta = std::acos(offset.z);
+    const float phi = std::atan2(offset.x, offset.y);
+    cameras.emplace_back(phi, theta, 1.0f, position + forward);
+  }
+}
+
 /**
 * Initialization of CUDA and GLFW.
 */
@@ -94,6 +126,8 @@ bool init(int argc, char **argv) {
   deviceName = ss.str();
 
   network_packet_create_thread = std::make_unique<std::thread>(Boids::networkPacketCreationLoop);
+
+  initializeVirtualCameras();
 
   // Rendering setup is not needed in compute-only mode.
 #if VISUALIZE

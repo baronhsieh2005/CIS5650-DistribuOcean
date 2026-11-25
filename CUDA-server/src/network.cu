@@ -101,6 +101,43 @@ std::vector<Boids::CameraCullData> queuedNetworkCameras;
 std::unique_ptr<bool[]> queuedNetworkCameraChanged;
 uint32_t queuedNetworkPhoneCount = 0;
 
+#if DEBUG_NETWORK_PIPELINE_TIMINGS
+enum NetworkTimingEvent {
+  NETWORK_TIMING_START,
+  NETWORK_TIMING_CULL,
+  NETWORK_TIMING_SORT,
+  NETWORK_TIMING_VISIBLE_COUNT,
+  NETWORK_TIMING_BUILD_EXISTING,
+  NETWORK_TIMING_CLEAR_SLOTS,
+  NETWORK_TIMING_COMPACT,
+  NETWORK_TIMING_ASSIGN_NEW,
+  NETWORK_TIMING_LENGTHS,
+  NETWORK_TIMING_COUNT,
+};
+cudaEvent_t networkTimingEvents[NETWORK_TIMING_COUNT] = {};
+
+void initializeNetworkTimingEvents() {
+  for (cudaEvent_t &event : networkTimingEvents) {
+    cudaEventCreate(&event);
+  }
+}
+
+void destroyNetworkTimingEvents() {
+  for (cudaEvent_t &event : networkTimingEvents) {
+    if (event != nullptr) {
+      cudaEventDestroy(event);
+      event = nullptr;
+    }
+  }
+}
+
+float elapsedNetworkTiming(NetworkTimingEvent start, NetworkTimingEvent end) {
+  float milliseconds = 0.0f;
+  cudaEventElapsedTime(&milliseconds, networkTimingEvents[start], networkTimingEvents[end]);
+  return milliseconds;
+}
+#endif
+
 __device__ bool isInsideCameraFrustum(const glm::vec3 &position,
   const Boids::CameraCullData &camera, float tolerance) {
   const glm::vec4 clipPosition = camera.projMat * glm::vec4(position, 1.0f);
@@ -155,6 +192,9 @@ __global__ void kernCullBoidsByCameras(uint32_t boidCount,
 void Boids::initializeNetworkPhones(const CameraCullData *cameras, uint32_t phoneCount) {
   if (network_stream == nullptr) {
     cudaStreamCreate(&network_stream);
+#if DEBUG_NETWORK_PIPELINE_TIMINGS
+    initializeNetworkTimingEvents();
+#endif
   }
   if (!phone_packet_send_threads.empty()) {
     stop_phone_packet_send_loop = true;
@@ -661,11 +701,17 @@ void Boids::createNetworkPackets() {
   }
 
   cudaStreamWaitEvent(network_stream, simulationSnapshotReadyEvent, 0);
+#if DEBUG_NETWORK_PIPELINE_TIMINGS
+  cudaEventRecord(networkTimingEvents[NETWORK_TIMING_START], network_stream);
+#endif
 
   dim3 blocksPerGrid((numObjects + blockSize - 1) / blockSize);
   kernCullBoidsByCameras<<<blocksPerGrid, blockSize, 0, network_stream>>>(numObjects, dev_pos_snapshot,
     dev_networkCameras, networkPhoneCount, dev_phoneDistanceBuffers, dev_phoneSortedBoidIndices);
   checkCUDAErrorWithLine("kernCullBoidsByCameras failed!");
+#if DEBUG_NETWORK_PIPELINE_TIMINGS
+  cudaEventRecord(networkTimingEvents[NETWORK_TIMING_CULL], network_stream);
+#endif
 
   for (uint32_t phoneIndex = 0; phoneIndex < networkPhoneCount; ++phoneIndex) {
     thrust::device_ptr<float> distanceBegin =
@@ -675,6 +721,9 @@ void Boids::createNetworkPackets() {
     thrust::sort_by_key(thrust::cuda::par_nosync.on(network_stream),
       distanceBegin, distanceBegin + numObjects, boidIndexBegin);
   }
+#if DEBUG_NETWORK_PIPELINE_TIMINGS
+  cudaEventRecord(networkTimingEvents[NETWORK_TIMING_SORT], network_stream);
+#endif
 
   dim3 cullCountBlockSize(32, 4);
   dim3 cullCountBlocksPerGrid((numObjects + cullCountBlockSize.x - 1) / cullCountBlockSize.x,
@@ -682,6 +731,9 @@ void Boids::createNetworkPackets() {
   kernGetFirstInf<<<cullCountBlocksPerGrid, cullCountBlockSize, 0, network_stream>>>(numObjects, networkPhoneCount,
     dev_phoneDistanceBuffers, dev_phoneVisibleCounts);
   checkCUDAErrorWithLine("kernGetFirstInf failed!");
+#if DEBUG_NETWORK_PIPELINE_TIMINGS
+  cudaEventRecord(networkTimingEvents[NETWORK_TIMING_VISIBLE_COUNT], network_stream);
+#endif
 
   const uint32_t packetWorkItems = networkPhoneCount * MAX_BOIDS_PER_PHONE;
   dim3 packetBlocksPerGrid((packetWorkItems + blockSize - 1) / blockSize);
@@ -691,11 +743,17 @@ void Boids::createNetworkPackets() {
     dev_boidSlotInPacketByPhone, dev_clientPositionsByPhone, dev_boidUpdatePackets,
     dev_boidNewPackets, dev_packetEpochsByPhone, dev_newBoidFlagsByPhone);
   checkCUDAErrorWithLine("kernBuildNetworkPackets failed!");
+#if DEBUG_NETWORK_PIPELINE_TIMINGS
+  cudaEventRecord(networkTimingEvents[NETWORK_TIMING_BUILD_EXISTING], network_stream);
+#endif
 
   kernClearFreePacketSlots<<<packetBlocksPerGrid, blockSize, 0, network_stream>>>(networkPhoneCount,
     currentEpoch, dev_boidSlotInPacketByPhone, dev_boidIdBySlotInPacket,
     dev_packetEpochsByPhone, dev_boidUpdatePackets, dev_freeSlotFlagsByPhone);
   checkCUDAErrorWithLine("kernClearFreePacketSlots failed!");
+#if DEBUG_NETWORK_PIPELINE_TIMINGS
+  cudaEventRecord(networkTimingEvents[NETWORK_TIMING_CLEAR_SLOTS], network_stream);
+#endif
 
   thrust::counting_iterator<uint32_t> slotIndices(0);
   for (uint32_t phone_idx = 0; phone_idx < networkPhoneCount; ++phone_idx) {
@@ -707,6 +765,9 @@ void Boids::createNetworkPackets() {
       slotIndices, hostNewBoidFlagsByPhone[phone_idx], hostNewRanksByPhone[phone_idx],
       dev_phoneNewCounts + phone_idx, MAX_BOIDS_PER_PHONE, network_stream);
   }
+#if DEBUG_NETWORK_PIPELINE_TIMINGS
+  cudaEventRecord(networkTimingEvents[NETWORK_TIMING_COMPACT], network_stream);
+#endif
 
 #if DEBUG_PACKET_LENGTHS
   std::vector<uint32_t> newBoidCounts(networkPhoneCount);
@@ -733,13 +794,31 @@ void Boids::createNetworkPackets() {
     dev_boidSlotInPacketByPhone, dev_boidIdBySlotInPacket, dev_packetEpochsByPhone,
     dev_clientPositionsByPhone, dev_boidNewPackets);
   checkCUDAErrorWithLine("kernAssignNewPacketSlots failed!");
+#if DEBUG_NETWORK_PIPELINE_TIMINGS
+  cudaEventRecord(networkTimingEvents[NETWORK_TIMING_ASSIGN_NEW], network_stream);
+#endif
 
   kernDeriveNetworkPayloadLengths<<<networkPhoneCount, blockSize, 0, network_stream>>>(networkPhoneCount,
     currentEpoch, dev_packetEpochsByPhone, dev_phoneNewCounts,
     dev_phoneUpdatePayloadLengths, dev_phoneNewPayloadLengths);
   checkCUDAErrorWithLine("kernDeriveNetworkPayloadLengths failed!");
+#if DEBUG_NETWORK_PIPELINE_TIMINGS
+  cudaEventRecord(networkTimingEvents[NETWORK_TIMING_LENGTHS], network_stream);
+#endif
 
   cudaStreamSynchronize(network_stream);
+#if DEBUG_NETWORK_PIPELINE_TIMINGS
+  printf("network GPU ms | cull %.3f | sort %.3f | visible %.3f | existing %.3f | clear %.3f | compact %.3f | new %.3f | lengths %.3f | total %.3f\n",
+    elapsedNetworkTiming(NETWORK_TIMING_START, NETWORK_TIMING_CULL),
+    elapsedNetworkTiming(NETWORK_TIMING_CULL, NETWORK_TIMING_SORT),
+    elapsedNetworkTiming(NETWORK_TIMING_SORT, NETWORK_TIMING_VISIBLE_COUNT),
+    elapsedNetworkTiming(NETWORK_TIMING_VISIBLE_COUNT, NETWORK_TIMING_BUILD_EXISTING),
+    elapsedNetworkTiming(NETWORK_TIMING_BUILD_EXISTING, NETWORK_TIMING_CLEAR_SLOTS),
+    elapsedNetworkTiming(NETWORK_TIMING_CLEAR_SLOTS, NETWORK_TIMING_COMPACT),
+    elapsedNetworkTiming(NETWORK_TIMING_COMPACT, NETWORK_TIMING_ASSIGN_NEW),
+    elapsedNetworkTiming(NETWORK_TIMING_ASSIGN_NEW, NETWORK_TIMING_LENGTHS),
+    elapsedNetworkTiming(NETWORK_TIMING_START, NETWORK_TIMING_LENGTHS));
+#endif
 }
 
 void Boids::cullBoidsByCameras(const CameraCullData *cameras, bool *cameraChanged,
@@ -857,6 +936,9 @@ void releaseNetworkBuffers() {
   cudaFree(dev_phoneNewPayloadLengths);
   cudaFree(dev_packetCompactionTempStorage);
   if (network_stream != nullptr) {
+#if DEBUG_NETWORK_PIPELINE_TIMINGS
+    destroyNetworkTimingEvents();
+#endif
     cudaStreamDestroy(network_stream);
     network_stream = nullptr;
   }
