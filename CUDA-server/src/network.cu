@@ -3,6 +3,7 @@
 #include <cuda.h>
 #include <math_constants.h>
 #include "kernel.h"
+#include "compact.cuh"
 #include "utilityCore.hpp"
 
 #include <cmath>
@@ -12,11 +13,6 @@
 #include <thread>
 #include <vector>
 
-#include <thrust/sort.h>
-#include <thrust/device_ptr.h>
-#include <thrust/execution_policy.h>
-#include <thrust/iterator/counting_iterator.h>
-#include <cub/cub.cuh>
 
 #include <glm/glm.hpp>
 
@@ -52,12 +48,10 @@ extern glm::vec3 *dev_pos_snapshot;
 extern cudaEvent_t simulationSnapshotReadyEvent;
 
 Boids::CameraCullData *dev_networkCameras;
-float **dev_phoneDistanceBuffers;
-uint32_t **dev_phoneSortedBoidIndices;
+uint32_t **dev_phoneSelectedBoidIndices;
 int32_t *dev_phoneVisibleCounts;
 uint32_t networkPhoneCount = 0;
-std::vector<float *> hostPhoneDistanceBuffers;
-std::vector<uint32_t *> hostPhoneSortedBoidIndices;
+std::vector<uint32_t *> hostPhoneSelectedBoidIndices;
 
 int **dev_boidSlotInPacketByPhone;
 glm::vec3 **dev_clientPositionsByPhone;
@@ -73,8 +67,29 @@ uint32_t *dev_phoneFreeCounts;
 uint32_t *dev_phoneNewCounts;
 uint32_t *dev_phoneUpdatePayloadLengths;
 uint32_t *dev_phoneNewPayloadLengths;
-void *dev_packetCompactionTempStorage;
-size_t packetCompactionTempStorageBytes = 0;
+static_assert(MAX_BOIDS_PER_PHONE <= 256 * 256,
+  "Batched compaction requires at most 256 block totals per list");
+uint8_t **dev_compactionMap = nullptr;
+uint32_t **dev_compactionOutput = nullptr;
+uint32_t **dev_compactionSizeOut = nullptr;
+uint32_t *dev_compactionScan = nullptr;
+uint32_t *dev_compactionBlockSums = nullptr;
+uint32_t *dev_compactionBlockOffsets = nullptr;
+
+void releaseCompactionBuffers() {
+  cudaFree(dev_compactionMap);
+  cudaFree(dev_compactionOutput);
+  cudaFree(dev_compactionSizeOut);
+  cudaFree(dev_compactionScan);
+  cudaFree(dev_compactionBlockSums);
+  cudaFree(dev_compactionBlockOffsets);
+  dev_compactionMap = nullptr;
+  dev_compactionOutput = nullptr;
+  dev_compactionSizeOut = nullptr;
+  dev_compactionScan = nullptr;
+  dev_compactionBlockSums = nullptr;
+  dev_compactionBlockOffsets = nullptr;
+}
 uint32_t networkEpoch = 0;
 std::vector<int *> hostBoidSlotInPacketByPhone;
 std::vector<glm::vec3 *> hostClientPositionsByPhone;
@@ -105,7 +120,6 @@ uint32_t queuedNetworkPhoneCount = 0;
 enum NetworkTimingEvent {
   NETWORK_TIMING_START,
   NETWORK_TIMING_CULL,
-  NETWORK_TIMING_SORT,
   NETWORK_TIMING_VISIBLE_COUNT,
   NETWORK_TIMING_BUILD_EXISTING,
   NETWORK_TIMING_CLEAR_SLOTS,
@@ -174,7 +188,7 @@ __device__ bool shouldBoidSurviveNaive(uint32_t boidIndex,
 
 __global__ void kernCullBoidsByCameras(uint32_t boidCount,
   const glm::vec3 *positions, const Boids::CameraCullData *cameras,
-  uint32_t phoneCount, float **distancesByPhone, uint32_t **sortedBoidIndicesByPhone) {
+  uint32_t phoneCount, int32_t *visibleCounts, uint32_t **selectedIndicesByPhone) {
   const uint32_t boidIndex = threadIdx.x + blockIdx.x * blockDim.x;
   if (boidIndex >= boidCount) {
     return;
@@ -184,8 +198,12 @@ __global__ void kernCullBoidsByCameras(uint32_t boidCount,
     float distanceToCamera;
     const bool survives = shouldBoidSurviveNaive(boidIndex, positions,
       cameras[phoneIndex], &distanceToCamera);
-    distancesByPhone[phoneIndex][boidIndex] = survives ? distanceToCamera : CUDART_INF_F;
-    sortedBoidIndicesByPhone[phoneIndex][boidIndex] = boidIndex;
+    if (survives) {
+      const int32_t rank = atomicAdd(visibleCounts + phoneIndex, 1);
+      if (rank < MAX_BOIDS_PER_PHONE) {
+        selectedIndicesByPhone[phoneIndex][rank] = boidIndex;
+      }
+    }
   }
 }
 
@@ -229,10 +247,7 @@ void Boids::initializeNetworkPhones(const CameraCullData *cameras, uint32_t phon
     host_phone_update_payload_lengths = nullptr;
     host_phone_new_payload_lengths = nullptr;
   }
-  for (float *distanceBuffer : hostPhoneDistanceBuffers) {
-    cudaFree(distanceBuffer);
-  }
-  for (uint32_t *sortedIndices : hostPhoneSortedBoidIndices) {
+  for (uint32_t *sortedIndices : hostPhoneSelectedBoidIndices) {
     cudaFree(sortedIndices);
   }
   for (int *slotMap : hostBoidSlotInPacketByPhone) {
@@ -280,8 +295,7 @@ void Boids::initializeNetworkPhones(const CameraCullData *cameras, uint32_t phon
   for (uint32_t *newRanks : hostNewRanksByPhone) {
     cudaFree(newRanks);
   }
-  hostPhoneDistanceBuffers.clear();
-  hostPhoneSortedBoidIndices.clear();
+  hostPhoneSelectedBoidIndices.clear();
   hostBoidSlotInPacketByPhone.clear();
   hostClientPositionsByPhone.clear();
   hostBoidUpdatePackets.clear();
@@ -293,8 +307,7 @@ void Boids::initializeNetworkPhones(const CameraCullData *cameras, uint32_t phon
   hostFreeSlotsByPhone.clear();
   hostNewRanksByPhone.clear();
   if (dev_networkCameras != nullptr) cudaFree(dev_networkCameras);
-  if (dev_phoneDistanceBuffers != nullptr) cudaFree(dev_phoneDistanceBuffers);
-  if (dev_phoneSortedBoidIndices != nullptr) cudaFree(dev_phoneSortedBoidIndices);
+  if (dev_phoneSelectedBoidIndices != nullptr) cudaFree(dev_phoneSelectedBoidIndices);
   if (dev_phoneVisibleCounts != nullptr) cudaFree(dev_phoneVisibleCounts);
   if (dev_boidSlotInPacketByPhone != nullptr) cudaFree(dev_boidSlotInPacketByPhone);
   if (dev_clientPositionsByPhone != nullptr) cudaFree(dev_clientPositionsByPhone);
@@ -310,11 +323,10 @@ void Boids::initializeNetworkPhones(const CameraCullData *cameras, uint32_t phon
   if (dev_phoneNewCounts != nullptr) cudaFree(dev_phoneNewCounts);
   if (dev_phoneUpdatePayloadLengths != nullptr) cudaFree(dev_phoneUpdatePayloadLengths);
   if (dev_phoneNewPayloadLengths != nullptr) cudaFree(dev_phoneNewPayloadLengths);
-  if (dev_packetCompactionTempStorage != nullptr) cudaFree(dev_packetCompactionTempStorage);
+  releaseCompactionBuffers();
 
   dev_networkCameras = nullptr;
-  dev_phoneDistanceBuffers = nullptr;
-  dev_phoneSortedBoidIndices = nullptr;
+  dev_phoneSelectedBoidIndices = nullptr;
   dev_phoneVisibleCounts = nullptr;
   dev_boidSlotInPacketByPhone = nullptr;
   dev_clientPositionsByPhone = nullptr;
@@ -330,8 +342,6 @@ void Boids::initializeNetworkPhones(const CameraCullData *cameras, uint32_t phon
   dev_phoneNewCounts = nullptr;
   dev_phoneUpdatePayloadLengths = nullptr;
   dev_phoneNewPayloadLengths = nullptr;
-  dev_packetCompactionTempStorage = nullptr;
-  packetCompactionTempStorageBytes = 0;
   networkEpoch = 0;
   networkPhoneCount = phoneCount;
   if (phoneCount == 0) {
@@ -361,13 +371,10 @@ void Boids::initializeNetworkPhones(const CameraCullData *cameras, uint32_t phon
     phone_packet_send_threads.emplace_back(Boids::phoneNetworkSendLoop, phoneIndex);
   }
 
-  hostPhoneDistanceBuffers.resize(phoneCount);
-  hostPhoneSortedBoidIndices.resize(phoneCount);
+  hostPhoneSelectedBoidIndices.resize(phoneCount);
   for (uint32_t phoneIndex = 0; phoneIndex < phoneCount; ++phoneIndex) {
-    cudaMalloc((void **)&hostPhoneDistanceBuffers[phoneIndex], numObjects * sizeof(float));
-    checkCUDAErrorWithLine("cudaMalloc phone distance buffer failed!");
-    cudaMalloc((void **)&hostPhoneSortedBoidIndices[phoneIndex], numObjects * sizeof(uint32_t));
-    checkCUDAErrorWithLine("cudaMalloc phone sorted-index buffer failed!");
+    cudaMalloc((void **)&hostPhoneSelectedBoidIndices[phoneIndex], MAX_BOIDS_PER_PHONE * sizeof(uint32_t));
+    checkCUDAErrorWithLine("cudaMalloc phone selected-index buffer failed!");
   }
 
   cudaMalloc((void **)&dev_networkCameras, phoneCount * sizeof(Boids::CameraCullData));
@@ -375,16 +382,11 @@ void Boids::initializeNetworkPhones(const CameraCullData *cameras, uint32_t phon
   cudaMemcpyAsync(dev_networkCameras, cameras, phoneCount * sizeof(Boids::CameraCullData),
     cudaMemcpyHostToDevice, network_stream);
   checkCUDAErrorWithLine("cudaMemcpy initial network cameras failed!");
-  cudaMalloc((void **)&dev_phoneDistanceBuffers, phoneCount * sizeof(float *));
-  checkCUDAErrorWithLine("cudaMalloc phone distance pointer array failed!");
-  cudaMemcpyAsync(dev_phoneDistanceBuffers, hostPhoneDistanceBuffers.data(),
-    phoneCount * sizeof(float *), cudaMemcpyHostToDevice, network_stream);
-  checkCUDAErrorWithLine("cudaMemcpy phone distance pointer array failed!");
-  cudaMalloc((void **)&dev_phoneSortedBoidIndices, phoneCount * sizeof(uint32_t *));
-  checkCUDAErrorWithLine("cudaMalloc phone sorted-index pointer array failed!");
-  cudaMemcpyAsync(dev_phoneSortedBoidIndices, hostPhoneSortedBoidIndices.data(),
+  cudaMalloc((void **)&dev_phoneSelectedBoidIndices, phoneCount * sizeof(uint32_t *));
+  checkCUDAErrorWithLine("cudaMalloc phone selected-index pointer array failed!");
+  cudaMemcpyAsync(dev_phoneSelectedBoidIndices, hostPhoneSelectedBoidIndices.data(),
     phoneCount * sizeof(uint32_t *), cudaMemcpyHostToDevice, network_stream);
-  checkCUDAErrorWithLine("cudaMemcpy phone sorted-index pointer array failed!");
+  checkCUDAErrorWithLine("cudaMemcpy phone selected-index pointer array failed!");
   cudaMalloc((void **)&dev_phoneVisibleCounts, phoneCount * sizeof(int32_t));
   checkCUDAErrorWithLine("cudaMalloc phone visible count array failed!");
 
@@ -444,36 +446,35 @@ void Boids::initializeNetworkPhones(const CameraCullData *cameras, uint32_t phon
   cudaMemcpyAsync(dev_newRanksByPhone, hostNewRanksByPhone.data(), phoneCount * sizeof(uint32_t *), cudaMemcpyHostToDevice, network_stream);
   checkCUDAErrorWithLine("cudaMemcpy network packet state pointers failed!");
 
-  thrust::counting_iterator<uint32_t> slotIndices(0);
-  size_t freeSelectBytes = 0;
-  size_t newSelectBytes = 0;
-  cub::DeviceSelect::Flagged(nullptr, freeSelectBytes, slotIndices,
-    hostFreeSlotFlagsByPhone[0], hostFreeSlotsByPhone[0], dev_phoneFreeCounts,
-    MAX_BOIDS_PER_PHONE);
-  cub::DeviceSelect::Flagged(nullptr, newSelectBytes, slotIndices,
-    hostNewBoidFlagsByPhone[0], hostNewRanksByPhone[0], dev_phoneNewCounts,
-    MAX_BOIDS_PER_PHONE);
-  packetCompactionTempStorageBytes = imax(freeSelectBytes, newSelectBytes);
-  cudaMalloc(&dev_packetCompactionTempStorage, packetCompactionTempStorageBytes);
-  checkCUDAErrorWithLine("cudaMalloc packet compaction storage failed!");
+  // Combine existing device buffers through small device pointer tables.
+  // Layout is [array type][phone]: free slots first, then new ranks.
+  std::vector<uint8_t *> compactionMap(hostFreeSlotFlagsByPhone);
+  compactionMap.insert(compactionMap.end(), hostNewBoidFlagsByPhone.begin(), hostNewBoidFlagsByPhone.end());
+  std::vector<uint32_t *> compactionOutput(hostFreeSlotsByPhone);
+  compactionOutput.insert(compactionOutput.end(), hostNewRanksByPhone.begin(), hostNewRanksByPhone.end());
+  uint32_t *compactionSizeOut[] = {dev_phoneFreeCounts, dev_phoneNewCounts};
+  const size_t listCount = 2 * static_cast<size_t>(phoneCount);
+  const size_t numBlocksX = (MAX_BOIDS_PER_PHONE + 255) / 256;
+  cudaMalloc((void **)&dev_compactionMap, listCount * sizeof(uint8_t *));
+  cudaMalloc((void **)&dev_compactionOutput, listCount * sizeof(uint32_t *));
+  cudaMalloc((void **)&dev_compactionSizeOut, 2 * sizeof(uint32_t *));
+  cudaMalloc((void **)&dev_compactionScan, listCount * MAX_BOIDS_PER_PHONE * sizeof(uint32_t));
+  cudaMalloc((void **)&dev_compactionBlockSums, listCount * numBlocksX * sizeof(uint32_t));
+  cudaMalloc((void **)&dev_compactionBlockOffsets, listCount * numBlocksX * sizeof(uint32_t));
+  checkCUDAErrorWithLine("cudaMalloc batched compaction buffers failed!");
+  cudaMemcpyAsync(dev_compactionMap, compactionMap.data(), listCount * sizeof(uint8_t *), cudaMemcpyHostToDevice, network_stream);
+  cudaMemcpyAsync(dev_compactionOutput, compactionOutput.data(), listCount * sizeof(uint32_t *), cudaMemcpyHostToDevice, network_stream);
+  cudaMemcpyAsync(dev_compactionSizeOut, compactionSizeOut, 2 * sizeof(uint32_t *), cudaMemcpyHostToDevice, network_stream);
+  cudaStreamSynchronize(network_stream);
+  checkCUDAErrorWithLine("initialize batched compaction pointer tables failed!");
 }
 
-__global__ void kernGetFirstInf(uint32_t boidCount, uint32_t phoneCount,
-  float **distancesByPhone, int32_t *visibleCounts) {
-  const uint32_t boidIndex = threadIdx.x + blockIdx.x * blockDim.x;
-  const uint32_t phoneIndex = threadIdx.y + blockIdx.y * blockDim.y;
-  if (boidIndex >= boidCount || phoneIndex >= phoneCount) {
-    return;
-  }
-
-  const float *distances = distancesByPhone[phoneIndex];
-  const bool currentIsInfinite = distances[boidIndex] == CUDART_INF_F;
-  if (boidIndex == 0 && currentIsInfinite) {
-    visibleCounts[phoneIndex] = -1;
-  } else if (boidIndex == boidCount - 1 && !currentIsInfinite) {
-    visibleCounts[phoneIndex] = imin(static_cast<int>(boidIndex), MAX_BOIDS_PER_PHONE - 1);
-  } else if (!currentIsInfinite && distances[boidIndex + 1] == CUDART_INF_F) {
-    visibleCounts[phoneIndex] = imin(static_cast<int>(boidIndex), MAX_BOIDS_PER_PHONE - 1);
+// Convert atomically appended survivor counts to the capped last-index convention used
+// by packet construction.  Zero survivors becomes -1.
+__global__ void kernCapVisibleCounts(uint32_t phoneCount, int32_t *visibleCounts) {
+  const uint32_t phone = threadIdx.x + blockIdx.x * blockDim.x;
+  if (phone < phoneCount) {
+    visibleCounts[phone] = imin(visibleCounts[phone], MAX_BOIDS_PER_PHONE) - 1;
   }
 }
 
@@ -561,7 +562,7 @@ __device__ glm::vec3 encodeNewBoidPosition(Boids::NewBoidData &boidNewData,
 
 __global__ void kernBuildNetworkPackets(uint32_t phoneCount, uint32_t currentEpoch,
   const glm::vec3 *boidPositions, const uint32_t *boidIds,
-  uint32_t **sortedBoidIndicesByPhone, const int32_t *visibleLastIndices,
+  uint32_t **selectedBoidIndicesByPhone, const int32_t *visibleLastIndices,
   int **boidSlotInPacketByPhone, glm::vec3 **clientPositionsByPhone,
   Boids::UpdateBoidData **boidUpdatePackets, Boids::NewBoidData **boidNewPackets,
   uint32_t **packetEpochsByPhone, uint8_t **newBoidFlagsByPhone) {
@@ -577,7 +578,7 @@ __global__ void kernBuildNetworkPackets(uint32_t phoneCount, uint32_t currentEpo
     return;
   }
 
-  const uint32_t currentBoidIndex = sortedBoidIndicesByPhone[phoneIndex][selectedRank];
+  const uint32_t currentBoidIndex = selectedBoidIndicesByPhone[phoneIndex][selectedRank];
   const uint32_t stableBoidId = boidIds[currentBoidIndex];
   const int slotInPacket = boidSlotInPacketByPhone[phoneIndex][stableBoidId];
   if (slotInPacket > -1) {
@@ -634,7 +635,7 @@ __global__ void kernClearFreePacketSlots(uint32_t phoneCount, uint32_t currentEp
 
 __global__ void kernAssignNewPacketSlots(uint32_t phoneCount, uint32_t currentEpoch,
   const glm::vec3 *boidPositions, const uint32_t *boidIds,
-  const Boids::CameraCullData *cameras, uint32_t **sortedBoidIndicesByPhone,
+  const Boids::CameraCullData *cameras, uint32_t **selectedBoidIndicesByPhone,
   uint32_t **newRanksByPhone, const uint32_t *newCounts,
   uint32_t **freeSlotsByPhone, const uint32_t *freeCounts,
   int **boidSlotInPacketByPhone, uint32_t **boidIdBySlotInPacket,
@@ -650,7 +651,7 @@ __global__ void kernAssignNewPacketSlots(uint32_t phoneCount, uint32_t currentEp
 
   const uint32_t selectedRank = newRanksByPhone[phoneIndex][newIndex];
   const uint32_t slot = freeSlotsByPhone[phoneIndex][newIndex];
-  const uint32_t currentBoidIndex = sortedBoidIndicesByPhone[phoneIndex][selectedRank];
+  const uint32_t currentBoidIndex = selectedBoidIndicesByPhone[phoneIndex][selectedRank];
   const uint32_t stableBoidId = boidIds[currentBoidIndex];
 
   boidSlotInPacketByPhone[phoneIndex][stableBoidId] = static_cast<int>(slot);
@@ -705,32 +706,18 @@ void Boids::createNetworkPackets() {
   cudaEventRecord(networkTimingEvents[NETWORK_TIMING_START], network_stream);
 #endif
 
+  cudaMemsetAsync(dev_phoneVisibleCounts, 0, networkPhoneCount * sizeof(int32_t), network_stream);
   dim3 blocksPerGrid((numObjects + blockSize - 1) / blockSize);
   kernCullBoidsByCameras<<<blocksPerGrid, blockSize, 0, network_stream>>>(numObjects, dev_pos_snapshot,
-    dev_networkCameras, networkPhoneCount, dev_phoneDistanceBuffers, dev_phoneSortedBoidIndices);
+    dev_networkCameras, networkPhoneCount, dev_phoneVisibleCounts, dev_phoneSelectedBoidIndices);
   checkCUDAErrorWithLine("kernCullBoidsByCameras failed!");
 #if DEBUG_NETWORK_PIPELINE_TIMINGS
   cudaEventRecord(networkTimingEvents[NETWORK_TIMING_CULL], network_stream);
 #endif
 
-  for (uint32_t phoneIndex = 0; phoneIndex < networkPhoneCount; ++phoneIndex) {
-    thrust::device_ptr<float> distanceBegin =
-      thrust::device_pointer_cast(hostPhoneDistanceBuffers[phoneIndex]);
-    thrust::device_ptr<uint32_t> boidIndexBegin =
-      thrust::device_pointer_cast(hostPhoneSortedBoidIndices[phoneIndex]);
-    thrust::sort_by_key(thrust::cuda::par_nosync.on(network_stream),
-      distanceBegin, distanceBegin + numObjects, boidIndexBegin);
-  }
-#if DEBUG_NETWORK_PIPELINE_TIMINGS
-  cudaEventRecord(networkTimingEvents[NETWORK_TIMING_SORT], network_stream);
-#endif
-
-  dim3 cullCountBlockSize(32, 4);
-  dim3 cullCountBlocksPerGrid((numObjects + cullCountBlockSize.x - 1) / cullCountBlockSize.x,
-    (networkPhoneCount + cullCountBlockSize.y - 1) / cullCountBlockSize.y);
-  kernGetFirstInf<<<cullCountBlocksPerGrid, cullCountBlockSize, 0, network_stream>>>(numObjects, networkPhoneCount,
-    dev_phoneDistanceBuffers, dev_phoneVisibleCounts);
-  checkCUDAErrorWithLine("kernGetFirstInf failed!");
+  kernCapVisibleCounts<<<(networkPhoneCount + blockSize - 1) / blockSize, blockSize, 0, network_stream>>>(
+    networkPhoneCount, dev_phoneVisibleCounts);
+  checkCUDAErrorWithLine("kernCapVisibleCounts failed!");
 #if DEBUG_NETWORK_PIPELINE_TIMINGS
   cudaEventRecord(networkTimingEvents[NETWORK_TIMING_VISIBLE_COUNT], network_stream);
 #endif
@@ -739,7 +726,7 @@ void Boids::createNetworkPackets() {
   dim3 packetBlocksPerGrid((packetWorkItems + blockSize - 1) / blockSize);
   const uint32_t currentEpoch = networkEpoch++;
   kernBuildNetworkPackets<<<packetBlocksPerGrid, blockSize, 0, network_stream>>>(networkPhoneCount,
-    currentEpoch, dev_pos_snapshot, dev_boidIds_snapshot, dev_phoneSortedBoidIndices, dev_phoneVisibleCounts,
+    currentEpoch, dev_pos_snapshot, dev_boidIds_snapshot, dev_phoneSelectedBoidIndices, dev_phoneVisibleCounts,
     dev_boidSlotInPacketByPhone, dev_clientPositionsByPhone, dev_boidUpdatePackets,
     dev_boidNewPackets, dev_packetEpochsByPhone, dev_newBoidFlagsByPhone);
   checkCUDAErrorWithLine("kernBuildNetworkPackets failed!");
@@ -755,16 +742,11 @@ void Boids::createNetworkPackets() {
   cudaEventRecord(networkTimingEvents[NETWORK_TIMING_CLEAR_SLOTS], network_stream);
 #endif
 
-  thrust::counting_iterator<uint32_t> slotIndices(0);
-  for (uint32_t phone_idx = 0; phone_idx < networkPhoneCount; ++phone_idx) {
-    size_t tempStorageBytes = packetCompactionTempStorageBytes;
-    cub::DeviceSelect::Flagged(dev_packetCompactionTempStorage, tempStorageBytes,
-      slotIndices, hostFreeSlotFlagsByPhone[phone_idx], hostFreeSlotsByPhone[phone_idx],
-      dev_phoneFreeCounts + phone_idx, MAX_BOIDS_PER_PHONE, network_stream);
-    cub::DeviceSelect::Flagged(dev_packetCompactionTempStorage, tempStorageBytes,
-      slotIndices, hostNewBoidFlagsByPhone[phone_idx], hostNewRanksByPhone[phone_idx],
-      dev_phoneNewCounts + phone_idx, MAX_BOIDS_PER_PHONE, network_stream);
-  }
+  batch_stream_compaction(MAX_BOIDS_PER_PHONE, networkPhoneCount, 2,
+    dev_compactionOutput, nullptr, dev_compactionMap, dev_compactionScan,
+    dev_compactionBlockSums, dev_compactionBlockOffsets, dev_compactionSizeOut,
+    network_stream);
+  checkCUDAErrorWithLine("batched packet compaction failed!");
 #if DEBUG_NETWORK_PIPELINE_TIMINGS
   cudaEventRecord(networkTimingEvents[NETWORK_TIMING_COMPACT], network_stream);
 #endif
@@ -779,17 +761,29 @@ void Boids::createNetworkPackets() {
     networkPhoneCount * sizeof(int32_t), cudaMemcpyDeviceToHost, network_stream);
   checkCUDAErrorWithLine("cudaMemcpy visible boid counts failed!");
   cudaStreamSynchronize(network_stream);
+  uint64_t totalUpdates = 0;
+  uint64_t totalNewBoids = 0;
+  uint32_t emptyPhones = 0;
+  uint32_t fullPhones = 0;
   for (uint32_t phone_idx = 0; phone_idx < networkPhoneCount; ++phone_idx) {
     const uint32_t selectedCount = visibleLastIndices[phone_idx] < 0 ? 0u :
       static_cast<uint32_t>(visibleLastIndices[phone_idx]) + 1u;
     const uint32_t updateCount = selectedCount - newBoidCounts[phone_idx];
-    printf("Phone %u compacted packet data: %u boid updates, %u new boids\n", phone_idx,
-      updateCount, newBoidCounts[phone_idx]);
+    totalUpdates += updateCount;
+    totalNewBoids += newBoidCounts[phone_idx];
+    emptyPhones += selectedCount == 0;
+    fullPhones += updateCount >= MAX_BOIDS_PER_PHONE-1;
   }
+  printf("All phones: %llu boid updates (%llu record bytes), %llu new boids (%llu record bytes), %u/%u phones with no selected boids, %u/%u phones with full boids\n",
+    static_cast<unsigned long long>(totalUpdates),
+    static_cast<unsigned long long>(totalUpdates * sizeof(Boids::UpdateBoidData)),
+    static_cast<unsigned long long>(totalNewBoids),
+    static_cast<unsigned long long>(totalNewBoids * sizeof(Boids::NewBoidData)),
+    emptyPhones, networkPhoneCount, fullPhones, networkPhoneCount);
 #endif
 
   kernAssignNewPacketSlots<<<packetBlocksPerGrid, blockSize, 0, network_stream>>>(networkPhoneCount,
-    currentEpoch, dev_pos_snapshot, dev_boidIds_snapshot, dev_networkCameras, dev_phoneSortedBoidIndices,
+    currentEpoch, dev_pos_snapshot, dev_boidIds_snapshot, dev_networkCameras, dev_phoneSelectedBoidIndices,
     dev_newRanksByPhone, dev_phoneNewCounts, dev_freeSlotsByPhone, dev_phoneFreeCounts,
     dev_boidSlotInPacketByPhone, dev_boidIdBySlotInPacket, dev_packetEpochsByPhone,
     dev_clientPositionsByPhone, dev_boidNewPackets);
@@ -808,10 +802,9 @@ void Boids::createNetworkPackets() {
 
   cudaStreamSynchronize(network_stream);
 #if DEBUG_NETWORK_PIPELINE_TIMINGS
-  printf("network GPU ms | cull %.3f | sort %.3f | visible %.3f | existing %.3f | clear %.3f | compact %.3f | new %.3f | lengths %.3f | total %.3f\n",
+  printf("network GPU ms | cull+append %.3f | cap %.3f | existing %.3f | clear %.3f | compact %.3f | new %.3f | lengths %.3f | total %.3f\n",
     elapsedNetworkTiming(NETWORK_TIMING_START, NETWORK_TIMING_CULL),
-    elapsedNetworkTiming(NETWORK_TIMING_CULL, NETWORK_TIMING_SORT),
-    elapsedNetworkTiming(NETWORK_TIMING_SORT, NETWORK_TIMING_VISIBLE_COUNT),
+    elapsedNetworkTiming(NETWORK_TIMING_CULL, NETWORK_TIMING_VISIBLE_COUNT),
     elapsedNetworkTiming(NETWORK_TIMING_VISIBLE_COUNT, NETWORK_TIMING_BUILD_EXISTING),
     elapsedNetworkTiming(NETWORK_TIMING_BUILD_EXISTING, NETWORK_TIMING_CLEAR_SLOTS),
     elapsedNetworkTiming(NETWORK_TIMING_CLEAR_SLOTS, NETWORK_TIMING_COMPACT),
@@ -843,8 +836,8 @@ void Boids::cullBoidsByCameras(const CameraCullData *cameras, bool *cameraChange
   createNetworkPackets();
 }
 
-float* const* Boids::getDevicePhoneDistances() {
-  return dev_phoneDistanceBuffers;
+uint32_t* const* Boids::getDevicePhoneSelectedBoidIndices() {
+  return dev_phoneSelectedBoidIndices;
 }
 
 const int32_t* Boids::getDevicePhoneVisibleCounts() {
@@ -898,9 +891,6 @@ void releaseNetworkBuffers() {
     phone_packet_payloads_ready_event = nullptr;
   }
 
-  for (float *distanceBuffer : hostPhoneDistanceBuffers) {
-    cudaFree(distanceBuffer);
-  }
   for (int *slotMap : hostBoidSlotInPacketByPhone) {
     cudaFree(slotMap);
   }
@@ -917,8 +907,7 @@ void releaseNetworkBuffers() {
     cudaFree(packetEpochs);
   }
   cudaFree(dev_networkCameras);
-  cudaFree(dev_phoneDistanceBuffers);
-  cudaFree(dev_phoneSortedBoidIndices);
+  cudaFree(dev_phoneSelectedBoidIndices);
   cudaFree(dev_phoneVisibleCounts);
   cudaFree(dev_boidSlotInPacketByPhone);
   cudaFree(dev_clientPositionsByPhone);
@@ -934,7 +923,7 @@ void releaseNetworkBuffers() {
   cudaFree(dev_phoneNewCounts);
   cudaFree(dev_phoneUpdatePayloadLengths);
   cudaFree(dev_phoneNewPayloadLengths);
-  cudaFree(dev_packetCompactionTempStorage);
+  releaseCompactionBuffers();
   if (network_stream != nullptr) {
 #if DEBUG_NETWORK_PIPELINE_TIMINGS
     destroyNetworkTimingEvents();
@@ -962,6 +951,11 @@ void Boids::requestNetworkPacket(const CameraCullData *cameras, bool *cameraChan
   }
   queuedNetworkPhoneCount = phoneCount;
   ready_create_network_packet_semaphore.release();
+#if DEBUG_PAUSE_SIMULATION_FOR_NETWORK
+  // The main simulation thread cannot enqueue the next step until the worker
+  // finishes the packet build and GPU-to-host copies.
+  network_packet_build_done.acquire();
+#endif
 }
 
 void Boids::stopNetworkPacketCreationLoop() {
@@ -998,6 +992,9 @@ void Boids::networkPacketCreationLoop() {
 
     cullBoidsByCameras(cameras.data(), cameraChanged.get(), phoneCount);
     if (stop_network_packet_creation_loop) {
+#if DEBUG_PAUSE_SIMULATION_FOR_NETWORK
+      network_packet_build_done.release();
+#endif
       return;
     }
     cudaMemcpyAsync(host_phone_update_payload_lengths, dev_phoneUpdatePayloadLengths,
@@ -1013,6 +1010,9 @@ void Boids::networkPacketCreationLoop() {
     if (network_data_done_sending_latch != nullptr) {
       network_data_done_sending_latch->wait();
       if (stop_network_packet_creation_loop) {
+#if DEBUG_PAUSE_SIMULATION_FOR_NETWORK
+        network_packet_build_done.release();
+#endif
         return;
       }
     }
@@ -1020,6 +1020,18 @@ void Boids::networkPacketCreationLoop() {
 
     cudaEventRecord(phone_packet_sizes_ready_event, network_stream);
     cudaEventSynchronize(phone_packet_sizes_ready_event);
+#if DEBUG_PACKET_LENGTHS
+    uint64_t totalUpdatePayloadBytes = 0;
+    uint64_t totalNewPayloadBytes = 0;
+    for (uint32_t phone = 0; phone < phoneCount; ++phone) {
+      totalUpdatePayloadBytes += host_phone_update_payload_lengths[phone];
+      totalNewPayloadBytes += host_phone_new_payload_lengths[phone];
+    }
+    printf("All phone payloads: %llu update bytes + %llu new bytes = %llu bytes (including update-slot gaps)\n",
+      static_cast<unsigned long long>(totalUpdatePayloadBytes),
+      static_cast<unsigned long long>(totalNewPayloadBytes),
+      static_cast<unsigned long long>(totalUpdatePayloadBytes + totalNewPayloadBytes));
+#endif
     for (uint32_t phone = 0; phone < phoneCount; ++phone) {
       cudaMemcpyAsync(host_phone_update_packets[phone], hostBoidUpdatePackets[phone],
         host_phone_update_payload_lengths[phone] * sizeof(uint8_t), cudaMemcpyDeviceToHost,
@@ -1034,6 +1046,9 @@ void Boids::networkPacketCreationLoop() {
     for (uint32_t phone = 0; phone < phoneCount; phone++) {
         phone_packet_ready_semaphore[phone]->release();
     }
+#if DEBUG_PAUSE_SIMULATION_FOR_NETWORK
+    network_packet_build_done.release();
+#endif
   }
 }
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cuda_runtime.h>
 #include <glm/glm.hpp>
 #include <atomic>
 #include <latch>
@@ -16,6 +17,12 @@
 // Set to 1 only when profiling individual network packet pipeline stages.
 #ifndef DEBUG_NETWORK_PIPELINE_TIMINGS
 #define DEBUG_NETWORK_PIPELINE_TIMINGS 1
+#endif
+
+// Temporarily isolate network timings from simulation GPU work.
+// Set to 0 to restore overlapping simulation and packet creation.
+#ifndef DEBUG_PAUSE_SIMULATION_FOR_NETWORK
+#define DEBUG_PAUSE_SIMULATION_FOR_NETWORK 1
 #endif
 
 namespace Boids {
@@ -65,7 +72,7 @@ namespace Boids {
     void copyBoidsToVBO(float *vbodptr_positions, float *vbodptr_velocities);
 
     const uint32_t* getDeviceBoidIds();
-    float* const* getDevicePhoneDistances();
+    uint32_t* const* getDevicePhoneSelectedBoidIndices();
     const int32_t* getDevicePhoneVisibleCounts();
     const uint32_t* getDevicePhoneUpdatePayloadLengths();
     const uint32_t* getDevicePhoneNewPayloadLengths();
@@ -76,6 +83,9 @@ namespace Boids {
     void endSimulation();
 
     inline std::binary_semaphore ready_create_network_packet_semaphore{0};
+#if DEBUG_PAUSE_SIMULATION_FOR_NETWORK
+    inline std::binary_semaphore network_packet_build_done{0};
+#endif
     inline std::atomic<bool> network_packet_request_outstanding{false};
     inline bool stop_network_packet_creation_loop = false;
     inline bool ready_request_network_packet = false;
@@ -89,3 +99,7 @@ namespace Boids {
     void networkPacketCreationLoop();
     void phoneNetworkSendLoop(int phone_idx);
 }
+
+void batch_stream_compaction(int num_slots, int num_phones, int num_arrays, uint32_t *const *odata, uint32_t *const *idata, uint8_t *const *map, uint32_t *scan,
+    uint32_t *block_sums, uint32_t *block_offsets,
+    uint32_t *const *size_out, cudaStream_t stream);

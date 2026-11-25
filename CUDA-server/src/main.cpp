@@ -26,11 +26,12 @@
 // ================
 
 
-const int N_FOR_VIS = 40000;
+const int N_FOR_VIS = 200000;
 const float DT = 0.2f;
 // Change this to control how many virtual phone cameras are tested.
-const uint32_t NUM_VIRTUAL_CAMERAS = 100;
-const float VIRTUAL_CAMERA_POSITION_EXTENT = 240.0f;
+const uint32_t NUM_VIRTUAL_CAMERAS = 20;
+// Spawn within the interior of the boids' +/-90-unit starting regions.
+const float VIRTUAL_CAMERA_POSITION_EXTENT = 45.0f;
 const uint32_t VIRTUAL_CAMERA_RANDOM_SEED = 5650;
 #ifndef VISUALIZE
 #define VISUALIZE 0
@@ -75,6 +76,13 @@ double simulationClockSeconds() {
 }
 
 void initializeVirtualCameras() {
+  // Match the three centers in kernGenerateFlockPositions.  Leave room between
+  // cameras and the region boundaries so random directions still see boids.
+  const glm::vec3 spawnCenters[] = {
+    glm::vec3(-75.0f, -30.0f, 0.0f),
+    glm::vec3(75.0f, -30.0f, 0.0f),
+    glm::vec3(0.0f, 75.0f, 0.0f),
+  };
   std::mt19937 random(VIRTUAL_CAMERA_RANDOM_SEED);
   std::uniform_real_distribution<float> positionDistribution(
     -VIRTUAL_CAMERA_POSITION_EXTENT, VIRTUAL_CAMERA_POSITION_EXTENT);
@@ -84,8 +92,8 @@ void initializeVirtualCameras() {
   cameras.clear();
   cameras.reserve(NUM_VIRTUAL_CAMERAS);
   for (uint32_t cameraIndex = 0; cameraIndex < NUM_VIRTUAL_CAMERAS; ++cameraIndex) {
-    const glm::vec3 position(positionDistribution(random), positionDistribution(random),
-      positionDistribution(random));
+    const glm::vec3 position = spawnCenters[cameraIndex % 3] +
+      glm::vec3(positionDistribution(random), positionDistribution(random), positionDistribution(random));
     const float azimuth = azimuthDistribution(random);
     const float vertical = verticalDistribution(random);
     const float horizontal = std::sqrt(1.0f - vertical * vertical);

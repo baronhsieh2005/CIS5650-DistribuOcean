@@ -51,6 +51,7 @@ include_directories(${GLM_INCLUDE_DIRS})
 find_package(CCCL REQUIRED)
 
 set(headers
+    src/compact.cuh
     src/cudaMat4.hpp
     src/glslUtility.hpp
     src/kernel.h
@@ -59,6 +60,7 @@ set(headers
     )
 
 set(sources
+    src/compact.cu
     src/glslUtility.cpp
     src/camera.cpp
     src/globalCamera.cpp
