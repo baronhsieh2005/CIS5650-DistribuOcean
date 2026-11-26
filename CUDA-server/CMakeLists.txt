@@ -51,6 +51,7 @@ include_directories(${GLM_INCLUDE_DIRS})
 find_package(CCCL REQUIRED)
 
 set(headers
+    src/config.h
     src/compact.cuh
     src/cudaMat4.hpp
     src/glslUtility.hpp
@@ -95,6 +96,36 @@ add_custom_target(run_boids
         $<TARGET_FILE:cis5650_boids>
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     DEPENDS cis5650_boids
+)
+
+# Select these targets in the IDE to build/run a separate Release configuration
+# without changing the active Debug cache or its Build All behavior.
+set(BOIDS_RELEASE_BUILD_DIR "${CMAKE_BINARY_DIR}/release")
+set(BOIDS_RELEASE_CONFIGURE_ARGS
+    -S "${CMAKE_SOURCE_DIR}"
+    -B "${BOIDS_RELEASE_BUILD_DIR}"
+    -G "${CMAKE_GENERATOR}"
+    -DCMAKE_BUILD_TYPE=Release
+    "-DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}"
+    "-DCMAKE_CUDA_COMPILER=${CMAKE_CUDA_COMPILER}"
+)
+if(CMAKE_CUDA_HOST_COMPILER)
+    list(APPEND BOIDS_RELEASE_CONFIGURE_ARGS
+        "-DCMAKE_CUDA_HOST_COMPILER=${CMAKE_CUDA_HOST_COMPILER}")
+endif()
+add_custom_target(build_release
+    COMMAND ${CMAKE_COMMAND} ${BOIDS_RELEASE_CONFIGURE_ARGS}
+    COMMAND ${CMAKE_COMMAND} --build "${BOIDS_RELEASE_BUILD_DIR}"
+        --config Release --target cis5650_boids --parallel
+    USES_TERMINAL
+    VERBATIM
+)
+add_custom_target(run_boids_release
+    COMMAND ${CMAKE_COMMAND} --build "${BOIDS_RELEASE_BUILD_DIR}"
+        --config Release --target run_boids
+    DEPENDS build_release
+    USES_TERMINAL
+    VERBATIM
 )
 
 add_custom_command(

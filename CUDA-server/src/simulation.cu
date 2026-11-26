@@ -44,52 +44,6 @@ void checkCUDAError(const char *msg, int line = -1) {
 }
 
 
-/*****************
-* Configuration *
-*****************/
-
-/*! Block size used for CUDA kernel launch. */
-#define blockSize 128
-
-#define rule1Distance 15.0f
-#define rule2Distance 9.0f
-#define rule3Distance 15.0f
-
-#define rule1Scale 0.01f
-#define rule2Scale 0.1f
-#define rule3Scale 0.1f
-
-#define maxSpeed 3.0f
-
-/*! Size of the starting area in simulation space. */
-#define scene_scale 300.0f
-#define spawnFlockRadius 90.0f
-
-#define cullDistanceTolerance 36.0f
-#define cullFrustumTolerance 0.12f
-
-#define MAX_BOIDS_PER_PHONE 20000
-
-#define DIST_VIEW 0
-#define DIST_SPHERE 1
-#define MIXED 2
-
-#ifndef CULL_TYPE
-#define CULL_TYPE DIST_VIEW
-#endif
-
-// MIXED keeps every nearby boid while a camera turns, then uses a slightly
-// expanded frustum for the remainder of the camera's distance range.
-#define mixedCullSphereFraction 0.5f
-
-// Each signed 16-bit position-delta component represents 1/1024 simulation units.
-// The encodable displacement range per packet is approximately [-32, 32] units.
-#define networkPositionDeltaScale (1.0f / 1024.0f)
-#define networkPositionDepthMaxDistance (Boids::cullDistance + cullDistanceTolerance)
-
-// All three uint16_t components set to this value denote a free/deleted slot.
-#define networkUpdateFreeComponent 0xFFFFu
-
 /***********************************************
 * Kernel state (pointers are device pointers) *
 ***********************************************/
@@ -104,6 +58,9 @@ uint32_t *dev_boidIds2;
 
 glm::vec3 *dev_pos_snapshot;
 uint32_t *dev_boidIds_snapshot;
+int *dev_gridStarts_snapshot;
+int *dev_gridEnds_snapshot;
+
 
 int *dev_particleArrayIndices;
 int *dev_particleGridIndices;
@@ -252,6 +209,10 @@ void Boids::initSimulation(int N) {
 
   cudaMalloc((void**)&dev_gridCellEndIndices, gridCellCount * sizeof(int));
   checkCUDAErrorWithLine("cudaMalloc dev_gridCellEndIndices failed!");
+
+  cudaMalloc((void**)&dev_gridStarts_snapshot, gridCellCount * sizeof(int));
+  cudaMalloc((void**)&dev_gridEnds_snapshot, gridCellCount * sizeof(int));
+  checkCUDAErrorWithLine("allocate network grid snapshot failed!");
 
   // needed for use with thrust
   dev_thrust_particleArrayIndices = thrust::device_pointer_cast(dev_particleArrayIndices);
@@ -508,7 +469,8 @@ const uint32_t* Boids::getDeviceBoidIds() {
   return dev_boidIds;
 }
 
-void Boids::stepSimulationCoherentGrid(float dt) {
+void Boids::stepSimulationCoherentGrid(float dt, const CameraCullData *cameras,
+    bool *cameraChanged, uint32_t phoneCount) {
     dim3 fullBlocksPerGrid((numObjects + blockSize - 1) / blockSize);
     int gridResolution = gridSideCount;
 
@@ -564,6 +526,18 @@ void Boids::stepSimulationCoherentGrid(float dt) {
     dev_thrust_vel1 = dev_thrust_vel2;
     dev_thrust_vel2 = tempThrustVel;
 
+    bool requestPacket = false;
+    {
+      std::lock_guard<std::mutex> lock(ready_request_network_packet_lock);
+      if (phoneCount != 0 && ready_request_network_packet) {
+        ready_request_network_packet = false;
+        requestPacket = true;
+      }
+    }
+    if (requestPacket) {
+      requestNetworkPacket(cameras, cameraChanged, phoneCount);
+    }
+
     kernUpdateVelNeighborSearchCoherent<<<fullBlocksPerGrid, blockSize, 0, simulation_stream>>>(numObjects, gridResolution, gridMinimum, gridInverseCellWidth, dev_gridCellStartIndices, dev_gridCellEndIndices, dev_pos, dev_vel1, dev_vel2);
     checkCUDAErrorWithLine("kernUpdateVelNeighborSearchCoherent failed!");
 
@@ -581,11 +555,22 @@ void Boids::stepSimulationCoherentGrid(float dt) {
     cudaStreamSynchronize(simulation_stream);
 }
 
+Boids::GridSnapshot Boids::getNetworkGridSnapshot() {
+  return {dev_gridStarts_snapshot, dev_gridEnds_snapshot,
+    static_cast<uint32_t>(gridCellCount), static_cast<uint32_t>(gridSideCount),
+    gridCellWidth, gridMinimum};
+}
+
 void Boids::prepareSimulationSnapshotsForNetwork() {
+    // Only called at the post-gather/pre-movement simulation boundary.
     cudaMemcpyAsync(dev_pos_snapshot, dev_pos, numObjects * sizeof(glm::vec3),
       cudaMemcpyDeviceToDevice, simulation_stream);
     cudaMemcpyAsync(dev_boidIds_snapshot, dev_boidIds, numObjects * sizeof(uint32_t),
       cudaMemcpyDeviceToDevice, simulation_stream);
+    cudaMemcpyAsync(dev_gridStarts_snapshot, dev_gridCellStartIndices,
+      gridCellCount * sizeof(int), cudaMemcpyDeviceToDevice, simulation_stream);
+    cudaMemcpyAsync(dev_gridEnds_snapshot, dev_gridCellEndIndices,
+      gridCellCount * sizeof(int), cudaMemcpyDeviceToDevice, simulation_stream);
     cudaEventRecord(simulationSnapshotReadyEvent, simulation_stream);
 }
 
@@ -598,6 +583,8 @@ void Boids::endSimulation() {
   cudaFree(dev_boidIds2);
   cudaFree(dev_pos_snapshot);
   cudaFree(dev_boidIds_snapshot);
+  cudaFree(dev_gridStarts_snapshot);
+  cudaFree(dev_gridEnds_snapshot);
   cudaFree(dev_pos);
   cudaFree(dev_pos2);
   cudaFree(dev_particleArrayIndices);

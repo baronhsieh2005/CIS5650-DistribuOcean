@@ -1,5 +1,7 @@
 #pragma once
 
+#include "config.h"
+
 #include <cstdint>
 #include <cuda_runtime.h>
 #include <glm/glm.hpp>
@@ -9,26 +11,16 @@
 #include <mutex>
 #include <semaphore>
 
-#ifndef DEBUG_MODE
-#define DEBUG_MODE 1
-#define DEBUG_PACKET_LENGTHS 0
-#endif
-
-// Set to 1 only when profiling individual network packet pipeline stages.
-#ifndef DEBUG_NETWORK_PIPELINE_TIMINGS
-#define DEBUG_NETWORK_PIPELINE_TIMINGS 1
-#endif
-
-// Temporarily isolate network timings from simulation GPU work.
-// Set to 0 to restore overlapping simulation and packet creation.
-#ifndef DEBUG_PAUSE_SIMULATION_FOR_NETWORK
-#define DEBUG_PAUSE_SIMULATION_FOR_NETWORK 1
-#endif
-
 namespace Boids {
-    constexpr float cullDistance = 900.0f;
-    constexpr uint16_t NEW_BOID_POLAR_ENCODING_BIT = 0x8000u;
-    constexpr uint16_t NEW_BOID_SLOT_MASK = 0x7FFFu;
+    struct GridSnapshot {
+        const int *cellStarts; // Iterate cellCount cells; skip start < 0.
+        const int *cellEnds; // Inclusive; empty cells have -1 offsets.
+        uint32_t cellCount;
+        uint32_t sideCount;
+        float cellWidth;
+        glm::vec3 minimum;
+    };
+    GridSnapshot getNetworkGridSnapshot();
 
     struct ViewPositionEncoding {
         uint8_t x_pos;
@@ -64,7 +56,8 @@ namespace Boids {
     static_assert(sizeof(UpdateBoidData) == 6, "Update boid records must occupy six bytes");
 
     void initSimulation(int N);
-    void stepSimulationCoherentGrid(float dt);
+    void stepSimulationCoherentGrid(float dt, const CameraCullData *cameras,
+                                   bool *cameraChanged, uint32_t phoneCount);
     void initializeNetworkPhones(const CameraCullData *cameras, uint32_t phoneCount);
     void createNetworkPackets();
     void cullBoidsByCameras(const CameraCullData *cameras, bool *cameraChanged,

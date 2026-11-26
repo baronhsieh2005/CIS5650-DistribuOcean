@@ -21,23 +21,6 @@
 #include <cuda_gl_interop.h>
 #include <glm/gtc/matrix_transform.hpp>
 
-// ================
-// Configuration
-// ================
-
-
-const int N_FOR_VIS = 200000;
-const float DT = 0.2f;
-// Change this to control how many virtual phone cameras are tested.
-const uint32_t NUM_VIRTUAL_CAMERAS = 20;
-// Spawn within the interior of the boids' +/-90-unit starting regions.
-const float VIRTUAL_CAMERA_POSITION_EXTENT = 45.0f;
-const uint32_t VIRTUAL_CAMERA_RANDOM_SEED = 5650;
-#ifndef VISUALIZE
-#define VISUALIZE 0
-#endif
-const double NETWORK_UPDATE_INTERVAL_SECONDS = 1.0 / 20.0;
-
 std::unique_ptr<std::thread> network_packet_create_thread;
 
 /**
@@ -299,7 +282,8 @@ void initShaders(GLuint * program) {
     cudaGLMapBufferObject((void**)&dptrVertVelocities, boidVBO_velocities);
 #endif
 
-    Boids::stepSimulationCoherentGrid(DT);
+    Boids::stepSimulationCoherentGrid(DT, networkCameras.data(), networkCameraChanged.get(),
+      static_cast<uint32_t>(networkCameras.size()));
 
     const double currentTime = simulationClockSeconds();
 #if !VISUALIZE || DEBUG_MODE
@@ -307,13 +291,6 @@ void initShaders(GLuint * program) {
     static uint32_t stepsSinceRateSample = 0;
     ++stepsSinceRateSample;
 #endif
-    std::unique_lock<std::mutex> lock(Boids::ready_request_network_packet_lock);
-    if (Boids::ready_request_network_packet) {
-        Boids::ready_request_network_packet = false;
-        lock.unlock();
-      Boids::requestNetworkPacket(networkCameras.data(), networkCameraChanged.get(),
-        static_cast<uint32_t>(networkCameras.size()));
-    }
 
 #if !VISUALIZE || DEBUG_MODE
     const double rateSampleDuration = currentTime - rateSampleStartTime;

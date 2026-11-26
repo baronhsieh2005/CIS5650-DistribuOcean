@@ -24,20 +24,7 @@
 #define imin( a, b ) ( ((a) < (b)) ? (a) : (b) )
 #endif
 
-#define blockSize 128
 #define checkCUDAErrorWithLine(msg) checkCUDAError(msg, __LINE__)
-
-#define cullDistanceTolerance 36.0f
-#define cullFrustumTolerance 0.12f
-#define MAX_BOIDS_PER_PHONE 20000
-#define DIST_VIEW 0
-#define DIST_SPHERE 1
-#define MIXED 2
-#define CULL_TYPE DIST_VIEW
-#define mixedCullSphereFraction 0.5f
-#define networkPositionDeltaScale (1.0f / 1024.0f)
-#define networkPositionDepthMaxDistance (Boids::cullDistance + cullDistanceTolerance)
-#define networkUpdateFreeComponent 0xFFFFu
 
 cudaStream_t network_stream = nullptr;
 
@@ -48,6 +35,7 @@ extern glm::vec3 *dev_pos_snapshot;
 extern cudaEvent_t simulationSnapshotReadyEvent;
 
 Boids::CameraCullData *dev_networkCameras;
+uint32_t *dev_cellCameraMasks = nullptr;
 uint32_t **dev_phoneSelectedBoidIndices;
 int32_t *dev_phoneVisibleCounts;
 uint32_t networkPhoneCount = 0;
@@ -119,6 +107,7 @@ uint32_t queuedNetworkPhoneCount = 0;
 #if DEBUG_NETWORK_PIPELINE_TIMINGS
 enum NetworkTimingEvent {
   NETWORK_TIMING_START,
+  NETWORK_TIMING_REGISTER,
   NETWORK_TIMING_CULL,
   NETWORK_TIMING_VISIBLE_COUNT,
   NETWORK_TIMING_BUILD_EXISTING,
@@ -204,6 +193,139 @@ __global__ void kernCullBoidsByCameras(uint32_t boidCount,
         selectedIndicesByPhone[phoneIndex][rank] = boidIndex;
       }
     }
+  }
+}
+
+__device__ bool cellIntersectsFrustum(const glm::vec3 &center, float halfWidth,
+    const Boids::CameraCullData &camera, float tolerance) {
+  const glm::mat4 &m = camera.projMat;
+  const glm::vec4 clip = m * glm::vec4(center, 1.0f);
+  const glm::vec3 rowW(m[0][3], m[1][3], m[2][3]);
+  const float extentW = halfWidth * (fabsf(rowW.x) + fabsf(rowW.y) + fabsf(rowW.z));
+  const float epsilon = 0.0001f * (1.0f + fabsf(clip.w) + extentW);
+  if (clip.w + extentW < -epsilon) return false;
+  const float limit = 1.0f + tolerance;
+  for (int axis = 0; axis < 3; ++axis) {
+    const glm::vec3 rowAxis(m[0][axis], m[1][axis], m[2][axis]);
+    const glm::vec3 plus = limit * rowW + rowAxis;
+    const glm::vec3 minus = limit * rowW - rowAxis;
+    const float plusExtent = halfWidth * (fabsf(plus.x) + fabsf(plus.y) + fabsf(plus.z));
+    const float minusExtent = halfWidth * (fabsf(minus.x) + fabsf(minus.y) + fabsf(minus.z));
+    if (limit * clip.w + clip[axis] + plusExtent < -epsilon ||
+        limit * clip.w - clip[axis] + minusExtent < -epsilon) return false;
+  }
+  return true;
+}
+
+__device__ bool cellIsVisible(uint32_t cellIdx, const Boids::GridSnapshot &grid,
+    const Boids::CameraCullData &camera) {
+  const uint32_t x = cellIdx % grid.sideCount;
+  const uint32_t y = (cellIdx / grid.sideCount) % grid.sideCount;
+  const uint32_t z = cellIdx / (grid.sideCount * grid.sideCount);
+  const float halfWidth = 0.5f * grid.cellWidth;
+  const glm::vec3 center = grid.minimum + grid.cellWidth *
+    (glm::vec3(x, y, z) + glm::vec3(0.5f));
+  const glm::vec3 d = glm::max(glm::abs(center - camera.position) -
+    glm::vec3(halfWidth), glm::vec3(0.0f));
+  const float distanceSquared = glm::dot(d, d);
+#if CULL_TYPE == MIXED
+  const float innerRadius = Boids::cullDistance * mixedCullSphereFraction;
+  if (distanceSquared <= innerRadius * innerRadius * (1.0f + 0.000001f)) return true;
+#endif
+  const float radius = Boids::cullDistance + cullDistanceTolerance;
+  if (distanceSquared > radius * radius * (1.0f + 0.000001f)) return false;
+#if CULL_TYPE == DIST_SPHERE
+  return true;
+#elif CULL_TYPE == DIST_VIEW
+  return cellIntersectsFrustum(center, halfWidth, camera, 0.0f);
+#elif CULL_TYPE == MIXED
+  return cellIntersectsFrustum(center, halfWidth, camera, cullFrustumTolerance);
+#endif
+}
+
+__global__ void gpicCullQueryRegisteringGrid(Boids::GridSnapshot grid, uint32_t phoneCount,
+    const Boids::CameraCullData *cameras, uint32_t *cellCameraMasks) {
+  const uint32_t cellIdx = threadIdx.x + blockIdx.x * blockDim.x;
+  const uint32_t cameraIdx = threadIdx.y + blockIdx.y * blockDim.y;
+  if (cellIdx >= grid.cellCount || cameraIdx >= phoneCount || grid.cellStarts[cellIdx] < 0) {
+    return;
+  }
+
+  const uint32_t word = cameraIdx / 32;
+  const uint32_t bit = cameraIdx % 32;
+  const int intsPerCell = (phoneCount + 31) / 32;
+
+  if (cellIsVisible(cellIdx, grid, cameras[cameraIdx])) {
+    atomicOr(&cellCameraMasks[static_cast<size_t>(cellIdx) * intsPerCell + word], 1u << bit);
+  }
+}
+
+__global__ void gpicNodeProcessing(Boids::GridSnapshot grid, uint32_t phoneCount,
+    const uint32_t *cellCameraMasks, const glm::vec3 *positions,
+    const Boids::CameraCullData *cameras, int32_t *visibleCounts,
+    uint32_t **selectedIndicesByPhone) {
+  const uint32_t cellIdx = blockIdx.x;
+  if (cellIdx >= grid.cellCount) return;
+
+  const int start = grid.cellStarts[cellIdx];
+  if (start < 0) return;
+
+  const uint32_t warpIdx = threadIdx.x / 32;
+  const uint32_t laneIdx = threadIdx.x % 32;
+  const uint32_t warpsPerBlock = blockDim.x / 32;
+  const uint32_t intsPerCell = (phoneCount + 31) / 32;
+
+  extern __shared__ glm::vec3 boidPositions[];
+  uint32_t *registeredCameras = reinterpret_cast<uint32_t *>(boidPositions + GPIC_SMEM_TILE_SIZE);
+  __shared__ uint32_t registeredCount;
+  if (threadIdx.x == 0) {
+    uint32_t count = 0;
+    for (uint32_t word = 0; word < intsPerCell; ++word) {
+      uint32_t mask = cellCameraMasks[static_cast<size_t>(cellIdx) * intsPerCell + word];
+      while (mask != 0) {
+        const uint32_t bit = __ffs(mask) - 1;
+        const uint32_t phoneIdx = word * 32 + bit;
+        if (phoneIdx < phoneCount) registeredCameras[count++] = phoneIdx;
+        mask &= mask - 1;
+      }
+    }
+    registeredCount = count;
+  }
+  __syncthreads();
+  if (registeredCount == 0) return;
+
+  const int end = grid.cellEnds[cellIdx];
+  for (int tileStart = start; tileStart <= end; tileStart += GPIC_SMEM_TILE_SIZE) {
+    const int tileCount = imin(GPIC_SMEM_TILE_SIZE, end - tileStart + 1);
+    for (int i = threadIdx.x; i < tileCount; i += blockDim.x) {
+      boidPositions[i] = positions[tileStart + i];
+    }
+    __syncthreads();
+
+    for (uint32_t query = warpIdx; query < registeredCount; query += warpsPerBlock) {
+      const uint32_t phoneIdx = registeredCameras[query];
+      const Boids::CameraCullData camera = cameras[phoneIdx];
+      for (int first = 0; first < tileCount; first += 32) {
+        const int i = first + laneIdx;
+        float distanceToCamera;
+        const bool visible = i < tileCount &&
+          shouldBoidSurviveNaive(i, boidPositions, camera, &distanceToCamera);
+        const uint32_t mask = __ballot_sync(0xFFFFFFFFu, visible);
+        if (mask == 0) continue;
+        int32_t firstRank = 0;
+        if (laneIdx == 0) {
+          firstRank = atomicAdd(visibleCounts + phoneIdx, __popc(mask));
+        }
+        firstRank = __shfl_sync(0xFFFFFFFFu, firstRank, 0);
+        if (visible) {
+          const int32_t rank = firstRank + __popc(mask & ((1u << laneIdx) - 1u));
+          if (rank < MAX_BOIDS_PER_PHONE) {
+            selectedIndicesByPhone[phoneIdx][rank] = tileStart + i;
+          }
+        }
+      }
+    }
+    __syncthreads();
   }
 }
 
@@ -307,6 +429,8 @@ void Boids::initializeNetworkPhones(const CameraCullData *cameras, uint32_t phon
   hostFreeSlotsByPhone.clear();
   hostNewRanksByPhone.clear();
   if (dev_networkCameras != nullptr) cudaFree(dev_networkCameras);
+  cudaFree(dev_cellCameraMasks);
+  dev_cellCameraMasks = nullptr;
   if (dev_phoneSelectedBoidIndices != nullptr) cudaFree(dev_phoneSelectedBoidIndices);
   if (dev_phoneVisibleCounts != nullptr) cudaFree(dev_phoneVisibleCounts);
   if (dev_boidSlotInPacketByPhone != nullptr) cudaFree(dev_boidSlotInPacketByPhone);
@@ -379,6 +503,10 @@ void Boids::initializeNetworkPhones(const CameraCullData *cameras, uint32_t phon
 
   cudaMalloc((void **)&dev_networkCameras, phoneCount * sizeof(Boids::CameraCullData));
   checkCUDAErrorWithLine("cudaMalloc network cameras failed!");
+  const auto grid = getNetworkGridSnapshot();
+  cudaMalloc((void **)&dev_cellCameraMasks,
+    static_cast<size_t>(grid.cellCount) * ((phoneCount + 31) / 32) * sizeof(uint32_t));
+  checkCUDAErrorWithLine("cudaMalloc cell camera masks failed!");
   cudaMemcpyAsync(dev_networkCameras, cameras, phoneCount * sizeof(Boids::CameraCullData),
     cudaMemcpyHostToDevice, network_stream);
   checkCUDAErrorWithLine("cudaMemcpy initial network cameras failed!");
@@ -543,7 +671,7 @@ __device__ glm::vec3 encodeNewBoidPosition(Boids::NewBoidData &boidNewData,
 
   constexpr float pi = 3.14159265358979323846f;
   constexpr float twoPi = 6.28318530717958647692f;
-  const glm::vec3 direction = distance > 1.0e-5f ? offset / distance : glm::vec3(0.0f, 0.0f, 1.0f);
+  const glm::vec3 direction = distance > 0.00001f ? offset / distance : glm::vec3(0.0f, 0.0f, 1.0f);
   float azimuth = atan2f(direction.y, direction.x);
   if (azimuth < 0.0f) azimuth += twoPi;
   const float elevation = asinf(fminf(1.0f, fmaxf(-1.0f, direction.z)));
@@ -705,12 +833,36 @@ void Boids::createNetworkPackets() {
 #if DEBUG_NETWORK_PIPELINE_TIMINGS
   cudaEventRecord(networkTimingEvents[NETWORK_TIMING_START], network_stream);
 #endif
+#if CULLING_TYPE == GPIC_CULLING
+  const auto grid = getNetworkGridSnapshot();
+  cudaMemsetAsync(dev_cellCameraMasks, 0,
+    static_cast<size_t>(grid.cellCount) * ((networkPhoneCount + 31) / 32) * sizeof(uint32_t),
+    network_stream);
+  const dim3 registrationThreads(32, 4);
+  const dim3 registrationBlocks((grid.cellCount + 31) / 32, (networkPhoneCount + 3) / 4);
+  gpicCullQueryRegisteringGrid<<<registrationBlocks, registrationThreads, 0, network_stream>>>(
+    grid, networkPhoneCount, dev_networkCameras, dev_cellCameraMasks);
+  checkCUDAErrorWithLine("G-PICS grid registration failed!");
+#endif
+#if DEBUG_NETWORK_PIPELINE_TIMINGS
+  cudaEventRecord(networkTimingEvents[NETWORK_TIMING_REGISTER], network_stream);
+#endif
 
   cudaMemsetAsync(dev_phoneVisibleCounts, 0, networkPhoneCount * sizeof(int32_t), network_stream);
+#if CULLING_TYPE == GPIC_CULLING
+  const dim3 nodeBlocks(grid.cellCount);
+  const size_t nodeSharedBytes = GPIC_SMEM_TILE_SIZE * sizeof(glm::vec3) +
+    static_cast<size_t>(networkPhoneCount) * sizeof(uint32_t);
+  gpicNodeProcessing<<<nodeBlocks, blockSize, nodeSharedBytes, network_stream>>>(grid, networkPhoneCount,
+    dev_cellCameraMasks, dev_pos_snapshot, dev_networkCameras,
+    dev_phoneVisibleCounts, dev_phoneSelectedBoidIndices);
+  checkCUDAErrorWithLine("G-PICS node processing failed!");
+#else
   dim3 blocksPerGrid((numObjects + blockSize - 1) / blockSize);
   kernCullBoidsByCameras<<<blocksPerGrid, blockSize, 0, network_stream>>>(numObjects, dev_pos_snapshot,
     dev_networkCameras, networkPhoneCount, dev_phoneVisibleCounts, dev_phoneSelectedBoidIndices);
   checkCUDAErrorWithLine("kernCullBoidsByCameras failed!");
+#endif
 #if DEBUG_NETWORK_PIPELINE_TIMINGS
   cudaEventRecord(networkTimingEvents[NETWORK_TIMING_CULL], network_stream);
 #endif
@@ -802,8 +954,9 @@ void Boids::createNetworkPackets() {
 
   cudaStreamSynchronize(network_stream);
 #if DEBUG_NETWORK_PIPELINE_TIMINGS
-  printf("network GPU ms | cull+append %.3f | cap %.3f | existing %.3f | clear %.3f | compact %.3f | new %.3f | lengths %.3f | total %.3f\n",
-    elapsedNetworkTiming(NETWORK_TIMING_START, NETWORK_TIMING_CULL),
+  printf("network GPU ms | register %.3f | cull+append %.3f | cap %.3f | existing %.3f | clear %.3f | compact %.3f | new %.3f | lengths %.3f | total %.3f\n",
+    elapsedNetworkTiming(NETWORK_TIMING_START, NETWORK_TIMING_REGISTER),
+    elapsedNetworkTiming(NETWORK_TIMING_REGISTER, NETWORK_TIMING_CULL),
     elapsedNetworkTiming(NETWORK_TIMING_CULL, NETWORK_TIMING_VISIBLE_COUNT),
     elapsedNetworkTiming(NETWORK_TIMING_VISIBLE_COUNT, NETWORK_TIMING_BUILD_EXISTING),
     elapsedNetworkTiming(NETWORK_TIMING_BUILD_EXISTING, NETWORK_TIMING_CLEAR_SLOTS),
@@ -907,6 +1060,8 @@ void releaseNetworkBuffers() {
     cudaFree(packetEpochs);
   }
   cudaFree(dev_networkCameras);
+  cudaFree(dev_cellCameraMasks);
+  dev_cellCameraMasks = nullptr;
   cudaFree(dev_phoneSelectedBoidIndices);
   cudaFree(dev_phoneVisibleCounts);
   cudaFree(dev_boidSlotInPacketByPhone);
