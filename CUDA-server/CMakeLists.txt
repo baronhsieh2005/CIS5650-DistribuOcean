@@ -52,7 +52,8 @@ find_package(CCCL REQUIRED)
 
 set(headers
     src/config.h
-    src/compact.cuh
+    src/packet_creation/compact.cuh
+    src/packet_creation/culling.h
     src/cudaMat4.hpp
     src/glslUtility.hpp
     src/kernel.h
@@ -61,12 +62,13 @@ set(headers
     )
 
 set(sources
-    src/compact.cu
+    src/packet_creation/compact.cu
+    src/packet_creation/culling.cu
     src/glslUtility.cpp
     src/camera.cpp
     src/globalCamera.cpp
     src/simulation.cu
-    src/network.cu
+    src/packet_creation/network.cu
     src/main.cpp
     src/utilityCore.cpp
     )
@@ -78,6 +80,7 @@ source_group(Headers FILES ${headers})
 source_group(Sources FILES ${sources})
 
 add_executable(${CMAKE_PROJECT_NAME} ${sources} ${headers})
+target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_link_libraries(${CMAKE_PROJECT_NAME} ${GL_LIBRARIES} CCCL::Thrust)
 if(CMAKE_VERSION VERSION_LESS "3.23.0")
     set_target_properties(${CMAKE_PROJECT_NAME} PROPERTIES CUDA_ARCHITECTURES OFF)

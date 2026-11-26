@@ -1,4 +1,5 @@
 #include "kernel.h"
+#include "compact.cuh"
 #include <cub/block/block_scan.cuh>
 
 __global__ void scanBlocks(int num_slots, int num_phones, int num_arrays,

@@ -5,7 +5,7 @@
 // Scene and camera setup.
 inline constexpr int N_FOR_VIS = 200000;
 inline constexpr float DT = 0.2f;
-inline constexpr uint32_t NUM_VIRTUAL_CAMERAS = 100;
+inline constexpr uint32_t NUM_VIRTUAL_CAMERAS = 20;
 // Camera offsets within the interior of the boids' starting regions.
 inline constexpr float VIRTUAL_CAMERA_POSITION_EXTENT = 45.0f;
 inline constexpr uint32_t VIRTUAL_CAMERA_RANDOM_SEED = 5650;
