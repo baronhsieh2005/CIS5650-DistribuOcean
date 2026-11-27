@@ -8,6 +8,7 @@
 
 #include "main.hpp"
 #include "kernel.h"
+#include "glintVisualizer.h"
 
 #include <atomic>
 #include <chrono>
@@ -365,12 +366,19 @@ void initShaders(GLuint * program) {
       glDrawArrays(GL_LINES, 0, cameraIconVertexCount);
       glLineWidth(1.0f);
 
+#if SIMULATION_TYPE == GLINT_SIMULATION
+      GlintVisualizer::draw(program[PROG_CAMERA_ICON]);
+#endif
+
       glUseProgram(0);
       glBindVertexArray(0);
 
       glfwSwapBuffers(window);
       #endif
     }
+#if SIMULATION_TYPE == GLINT_SIMULATION
+    GlintVisualizer::shutdown();
+#endif
     glfwDestroyWindow(window);
     glfwTerminate();
 #else
@@ -400,6 +408,13 @@ void initShaders(GLuint * program) {
       updateCameraIcons();
       updateActiveCameraUniform();
     }
+  #if VISUALIZE && SIMULATION_TYPE == GLINT_SIMULATION
+    if (key == GLFW_KEY_H && action == GLFW_PRESS) {
+      if (!(mods & GLFW_MOD_SHIFT)) {
+        GlintVisualizer::toggle();
+      }
+    }
+  #endif
     if (!useGlobalCamera && (action == GLFW_PRESS || action == GLFW_REPEAT)) {
       constexpr float moveStep = 0.25f;
       if (key == GLFW_KEY_W) cameras[currCamera].move(moveStep, 0.0f, 0.0f);

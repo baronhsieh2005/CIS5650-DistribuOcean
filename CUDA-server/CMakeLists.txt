@@ -52,6 +52,8 @@ find_package(CCCL REQUIRED)
 
 set(headers
     src/config.h
+    src/glintVisualizer.h
+    src/glintVisualizer.cuh
     src/packet_creation/glint.h
     src/packet_creation/compact.cuh
     src/packet_creation/culling.h

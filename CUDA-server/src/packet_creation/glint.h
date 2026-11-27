@@ -78,6 +78,9 @@ public:
     LeafData get_leaf_data() const {
         return {node_lst, part_lst, active_leaves, host_num_active_leaves};
     }
+#if VISUALIZE
+    uint64_t get_topology_revision() const { return topology_revision; }
+#endif
 
     void init(int boid_count, const glm::vec3 *device_positions,
         int depth = GLINT_INITIAL_MAX_DEPTH);
@@ -88,6 +91,9 @@ public:
     void update_velocity(const glm::vec3 *dev_vel1, glm::vec3 *dev_vel2, cudaStream_t simulation_stream);
     void update_tree(cudaStream_t simulation_stream);
 private:
+#if VISUALIZE
+    uint64_t topology_revision = 0;
+#endif
     // Borrowed simulation positions; all other device allocations below are owned.
     const glm::vec3 *points_lst = nullptr;
     GlintNode *node_lst = nullptr;

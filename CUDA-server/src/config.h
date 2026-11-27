@@ -3,14 +3,14 @@
 #include <cstdint>
 
 // Scene and camera setup.
-inline constexpr int N_FOR_VIS = 150000;
+inline constexpr int N_FOR_VIS = 80000;
 inline constexpr float DT = 0.2f;
-inline constexpr uint32_t NUM_VIRTUAL_CAMERAS = 100;
+inline constexpr uint32_t NUM_VIRTUAL_CAMERAS = 40;
 // Camera offsets within the interior of the boids' starting regions.
 inline constexpr float VIRTUAL_CAMERA_POSITION_EXTENT = 45.0f;
 inline constexpr uint32_t VIRTUAL_CAMERA_RANDOM_SEED = 5650;
 #ifndef VISUALIZE
-#define VISUALIZE 0
+#define VISUALIZE 1
 #endif
 inline constexpr double NETWORK_UPDATE_INTERVAL_SECONDS = 1.0 / 20.0;
 
@@ -30,7 +30,7 @@ inline constexpr int blockSize = 128;
 #define GRID_SIMULATION 0
 #define GLINT_SIMULATION 1
 #ifndef SIMULATION_TYPE
-#define SIMULATION_TYPE GRID_SIMULATION
+#define SIMULATION_TYPE GLINT_SIMULATION
 #endif
 
 // Culling implementation and visibility predicate are independent choices.
@@ -38,7 +38,7 @@ inline constexpr int blockSize = 128;
 #define GPIC_CULLING 1
 #define GPIC_GLINT_CULLING 2
 #ifndef CULLING_TYPE
-#define CULLING_TYPE GPIC_CULLING
+#define CULLING_TYPE GPIC_GLINT_CULLING
 #endif
 
 #define DIST_VIEW 0

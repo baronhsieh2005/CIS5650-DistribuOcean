@@ -9,6 +9,10 @@
 #include <string>
 #include <utility>
 
+#if VISUALIZE && SIMULATION_TYPE == GLINT_SIMULATION
+#include "../glintVisualizer.cuh"
+#endif
+
 using GlintNode = GlintOctree::GlintNode;
 using PartitionBuff = GlintOctree::PartitionBuff;
 using RefinePair = GlintOctree::RefinePair;
@@ -723,6 +727,9 @@ void GlintOctree::init(int boid_count, const glm::vec3 *device_positions, int de
         checkGlintCUDA(cudaMemcpy(&host_refine_lst_size, refine_lst_size,
             sizeof(host_refine_lst_size), cudaMemcpyDeviceToHost));
         checkGlintCUDA(cudaDeviceSynchronize());
+#if VISUALIZE
+        ++topology_revision;
+#endif
     } catch (...) {
         deletion();
         throw;
@@ -867,5 +874,8 @@ void GlintOctree::update_tree(cudaStream_t simulation_stream) {
     std::swap(potential_leaf_parents, next_potential_leaf_parents);
     std::swap(num_active_leaves, next_num_active_leaves);
     std::swap(num_potential_leaf_parents, next_num_potential_leaf_parents);
+#if VISUALIZE
+    ++topology_revision;
+#endif
 }
 
