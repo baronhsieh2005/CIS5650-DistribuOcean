@@ -291,13 +291,13 @@ void initShaders(GLuint * program) {
       static_cast<uint32_t>(networkCameras.size()));
 #endif
     const double currentTime = simulationClockSeconds();
-#if !VISUALIZE || DEBUG_MODE
+#if !VISUALIZE || DEBUG_MODE || DEBUG_GLINT_PIPELINE_TIMINGS || DEBUG_GLINT_TREE_UPDATES
     static double rateSampleStartTime = currentTime;
     static uint32_t stepsSinceRateSample = 0;
     ++stepsSinceRateSample;
 #endif
 
-#if !VISUALIZE || DEBUG_MODE
+#if !VISUALIZE || DEBUG_MODE || DEBUG_GLINT_PIPELINE_TIMINGS || DEBUG_GLINT_TREE_UPDATES
     const double rateSampleDuration = currentTime - rateSampleStartTime;
     if (rateSampleDuration >= 1.0) {
       printf("%.1f simulation steps/s", stepsSinceRateSample / rateSampleDuration);
@@ -310,6 +310,9 @@ void initShaders(GLuint * program) {
       previouslyCompletedNetworkPackets = completedPackets;
 #endif
       printf("\n");
+#if SIMULATION_TYPE == GLINT_SIMULATION && (DEBUG_GLINT_PIPELINE_TIMINGS || DEBUG_GLINT_TREE_UPDATES)
+      Boids::printGlintDebugStats();
+#endif
       rateSampleStartTime = currentTime;
       stepsSinceRateSample = 0;
     }

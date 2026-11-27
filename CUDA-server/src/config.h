@@ -3,14 +3,14 @@
 #include <cstdint>
 
 // Scene and camera setup.
-inline constexpr int N_FOR_VIS = 150000;
+inline constexpr int N_FOR_VIS = 200000;
 inline constexpr float DT = 0.2f;
 inline constexpr uint32_t NUM_VIRTUAL_CAMERAS = 100;
 // Camera offsets within the interior of the boids' starting regions.
 inline constexpr float VIRTUAL_CAMERA_POSITION_EXTENT = 45.0f;
 inline constexpr uint32_t VIRTUAL_CAMERA_RANDOM_SEED = 5650;
 #ifndef VISUALIZE
-#define VISUALIZE 0
+#define VISUALIZE 1
 #endif
 inline constexpr double NETWORK_UPDATE_INTERVAL_SECONDS = 1.0 / 20.0;
 
@@ -30,7 +30,7 @@ inline constexpr int blockSize = 128;
 #define GRID_SIMULATION 0
 #define GLINT_SIMULATION 1
 #ifndef SIMULATION_TYPE
-#define SIMULATION_TYPE GRID_SIMULATION
+#define SIMULATION_TYPE GLINT_SIMULATION
 #endif
 
 // Culling implementation and visibility predicate are independent choices.
@@ -66,13 +66,21 @@ namespace Boids {
 
 // Debug switches can also be overridden through compiler definitions.
 #ifndef DEBUG_MODE
-#define DEBUG_MODE 1
+#define DEBUG_MODE 0
 #endif
 #ifndef DEBUG_PACKET_LENGTHS
 #define DEBUG_PACKET_LENGTHS 0
 #endif
 #ifndef DEBUG_NETWORK_PIPELINE_TIMINGS
 #define DEBUG_NETWORK_PIPELINE_TIMINGS 0
+#endif
+// Average individual GLINT operations over each simulation-rate report interval.
+#ifndef DEBUG_GLINT_PIPELINE_TIMINGS
+#define DEBUG_GLINT_PIPELINE_TIMINGS 0
+#endif
+// Can be enabled independently without creating timing events.
+#ifndef DEBUG_GLINT_TREE_UPDATES
+#define DEBUG_GLINT_TREE_UPDATES DEBUG_GLINT_PIPELINE_TIMINGS
 #endif
 // Set to 0 to overlap simulation with packet creation.
 #ifndef DEBUG_PAUSE_SIMULATION_FOR_NETWORK

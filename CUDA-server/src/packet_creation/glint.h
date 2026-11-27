@@ -91,7 +91,39 @@ public:
     void update_filter(cudaStream_t simulation_stream);
     void update_velocity(const glm::vec3 *dev_vel1, glm::vec3 *dev_vel2, cudaStream_t simulation_stream);
     void update_tree(cudaStream_t simulation_stream);
+#if DEBUG_GLINT_PIPELINE_TIMINGS || DEBUG_GLINT_TREE_UPDATES
+    void begin_debug_step();
+    // Called after the simulation's existing end-of-step stream synchronization.
+    void finish_debug_step();
+    void print_debug_stats();
+#endif
+#if DEBUG_GLINT_PIPELINE_TIMINGS
+    enum TimingStage {
+        GLINT_TIMING_LEAF_RESET, GLINT_TIMING_FILTER_RESET, GLINT_TIMING_PARTITION,
+        GLINT_TIMING_FILTER_COUNT, GLINT_TIMING_FILTER, GLINT_TIMING_REFINE_COUNT,
+        GLINT_TIMING_ACCUM_RESET, GLINT_TIMING_REFINEMENT, GLINT_TIMING_FINALIZE,
+        GLINT_TIMING_TREE_RESET, GLINT_TIMING_SPLIT, GLINT_TIMING_MERGE,
+        GLINT_TIMING_TREE_FLAG, GLINT_TIMING_MERGE_EVENTS, GLINT_TIMING_SCAN,
+        GLINT_TIMING_SCATTER, GLINT_TIMING_LEAF_COUNTS, GLINT_TIMING_MOVE,
+        GLINT_TIMING_SNAPSHOT_COPY, GLINT_TIMING_SNAPSHOT_SCAN, GLINT_TIMING_SNAPSHOT_LEAVES,
+        GLINT_TIMING_COUNT
+    };
+    void begin_debug_stage(TimingStage stage, cudaStream_t simulation_stream);
+    void end_debug_stage(TimingStage stage, cudaStream_t simulation_stream);
+#endif
 private:
+#if DEBUG_GLINT_PIPELINE_TIMINGS || DEBUG_GLINT_TREE_UPDATES
+    uint64_t debug_steps = 0;
+    uint64_t debug_tree_updates = 0;
+    uint64_t debug_tree_unchanged = 0;
+    bool debug_step_active = false;
+#endif
+#if DEBUG_GLINT_PIPELINE_TIMINGS
+    cudaEvent_t timing_start[GLINT_TIMING_COUNT] = {};
+    cudaEvent_t timing_end[GLINT_TIMING_COUNT] = {};
+    bool timing_recorded[GLINT_TIMING_COUNT] = {};
+    double timing_totals[GLINT_TIMING_COUNT] = {};
+#endif
 #if VISUALIZE
     uint64_t topology_revision = 0;
 #endif

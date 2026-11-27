@@ -73,6 +73,9 @@ namespace Boids {
     void stepSimulationCoherentGrid(float dt, const CameraCullData *cameras,
                                    bool *cameraChanged, uint32_t phoneCount);
     void stepSimulationGlint(float dt, CameraCullData *cameras, bool *cameraChanged, uint32_t phoneCount);
+#if DEBUG_GLINT_PIPELINE_TIMINGS || DEBUG_GLINT_TREE_UPDATES
+    void printGlintDebugStats();
+#endif
     void initializeNetworkPhones(const CameraCullData *cameras, uint32_t phoneCount);
     void createNetworkPackets();
     void cullBoidsByCameras(const CameraCullData *cameras, bool *cameraChanged,

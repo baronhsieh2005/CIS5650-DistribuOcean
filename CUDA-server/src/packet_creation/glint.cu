@@ -8,6 +8,18 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <cstdio>
+#if DEBUG_GLINT_PIPELINE_TIMINGS || DEBUG_GLINT_TREE_UPDATES
+#include <sstream>
+#endif
+
+#if DEBUG_GLINT_PIPELINE_TIMINGS
+#define GLINT_TIME_BEGIN(stage) begin_debug_stage(GLINT_TIMING_##stage, simulation_stream)
+#define GLINT_TIME_END(stage) end_debug_stage(GLINT_TIMING_##stage, simulation_stream)
+#else
+#define GLINT_TIME_BEGIN(stage) ((void)0)
+#define GLINT_TIME_END(stage) ((void)0)
+#endif
 
 #if VISUALIZE && SIMULATION_TYPE == GLINT_SIMULATION
 #include "../glintVisualizer.cuh"
@@ -649,6 +661,12 @@ void GlintOctree::init(int boid_count, const glm::vec3 *device_positions, cudaSt
             count * sizeof(*pointer), simulation_stream));
     };
     try {
+#if DEBUG_GLINT_PIPELINE_TIMINGS
+        for (int i = 0; i < GLINT_TIMING_COUNT; ++i) {
+            checkGlintCUDA(cudaEventCreate(&timing_start[i]));
+            checkGlintCUDA(cudaEventCreate(&timing_end[i]));
+        }
+#endif
         allocate(node_lst, NODE_STK_MAX_SIZE);
         allocate(node_stk, NODE_STK_MAX_SIZE);
         allocate(part_lst, PART_STK_MAX_SIZE);
@@ -794,6 +812,19 @@ void GlintOctree::deletion(cudaStream_t simulation_stream) {
     release(topology_changed);
     release(compact_temp);
     cudaStreamSynchronize(simulation_stream);
+#if DEBUG_GLINT_PIPELINE_TIMINGS
+    for (int i = 0; i < GLINT_TIMING_COUNT; ++i) {
+        if (timing_start[i]) cudaEventDestroy(timing_start[i]);
+        if (timing_end[i]) cudaEventDestroy(timing_end[i]);
+        timing_start[i] = timing_end[i] = nullptr;
+        timing_recorded[i] = false;
+        timing_totals[i] = 0.0;
+    }
+#endif
+#if DEBUG_GLINT_PIPELINE_TIMINGS || DEBUG_GLINT_TREE_UPDATES
+    debug_steps = debug_tree_updates = debug_tree_unchanged = 0;
+    debug_step_active = false;
+#endif
     compact_temp_bytes = 0;
     num_boids = max_depth = initial_node_count = 0;
     host_num_active_leaves = host_num_potential_leaf_parents = 0;
@@ -806,47 +837,65 @@ void GlintOctree::update_partition(const glm::vec3 *dev_positions, cudaStream_t 
 
     const int threads = GLINT_THREADS_PER_BLOCK;
     const int leaf_blocks = (host_num_active_leaves + threads - 1) / threads;
+    GLINT_TIME_BEGIN(LEAF_RESET);
     reset_leaf_count<<<leaf_blocks, threads, 0, simulation_stream>>>(host_num_active_leaves, active_leaves, node_lst);
+    GLINT_TIME_END(LEAF_RESET);
     checkGlintCUDA(cudaGetLastError());
 
+    GLINT_TIME_BEGIN(FILTER_RESET);
     checkGlintCUDA(cudaMemsetAsync(filter_lst_size, 0, sizeof(int), simulation_stream));
+    GLINT_TIME_END(FILTER_RESET);
+    GLINT_TIME_BEGIN(PARTITION);
     partition<<<(num_boids + threads - 1) / threads, threads, 0, simulation_stream>>>(num_boids,
         points_lst, node_lst, part_lst, filter_lst, filter_lst_size, refine_lst, refine_lst_size);
+    GLINT_TIME_END(PARTITION);
     checkGlintCUDA(cudaGetLastError());
 }
 
 void GlintOctree::update_filter(cudaStream_t simulation_stream) {
     const int threads = GLINT_THREADS_PER_BLOCK;
+    GLINT_TIME_BEGIN(FILTER_COUNT);
     checkGlintCUDA(cudaMemcpyAsync(&host_filter_lst_size, filter_lst_size,
         sizeof(host_filter_lst_size), cudaMemcpyDeviceToHost, simulation_stream));
+    GLINT_TIME_END(FILTER_COUNT);
     checkGlintCUDA(cudaStreamSynchronize(simulation_stream));
     if (host_filter_lst_size > 0) {
         const int filter_blocks = (host_filter_lst_size + threads - 1) / threads;
         const size_t shared_bytes = GLINT_FILTER_STACK_CAPACITY * sizeof(FilterEntry);
+        GLINT_TIME_BEGIN(FILTER);
         filter<<<filter_blocks, threads, shared_bytes, simulation_stream>>>(host_filter_lst_size,
             filter_lst, points_lst, node_lst, refine_lst, refine_lst_size);
+        GLINT_TIME_END(FILTER);
         checkGlintCUDA(cudaGetLastError());
     }
+    GLINT_TIME_BEGIN(REFINE_COUNT);
     checkGlintCUDA(cudaMemcpyAsync(&host_refine_lst_size, refine_lst_size,
         sizeof(host_refine_lst_size), cudaMemcpyDeviceToHost, simulation_stream));
+    GLINT_TIME_END(REFINE_COUNT);
     checkGlintCUDA(cudaStreamSynchronize(simulation_stream));
 }
 
 void GlintOctree::update_velocity(const glm::vec3 *dev_vel1, glm::vec3 *dev_vel2, cudaStream_t simulation_stream) {
     const int threads = GLINT_THREADS_PER_BLOCK;
     const int boid_blocks = (num_boids + threads - 1) / threads;
+    GLINT_TIME_BEGIN(ACCUM_RESET);
     reset_interaction_accumulators<<<boid_blocks, threads, 0, simulation_stream>>>(num_boids,
         position_sum, separation_sum, velocity_sum, cohesion_count, alignment_count);
+    GLINT_TIME_END(ACCUM_RESET);
     checkGlintCUDA(cudaGetLastError());
     if (host_refine_lst_size > 0) {
         const int refinement_blocks = (host_refine_lst_size + threads - 1) / threads;
+        GLINT_TIME_BEGIN(REFINEMENT);
         refinement<<<refinement_blocks, threads, 0, simulation_stream>>>(host_refine_lst_size,
             refine_lst, points_lst, part_lst, dev_vel1,
             position_sum, separation_sum, velocity_sum, cohesion_count, alignment_count);
+        GLINT_TIME_END(REFINEMENT);
         checkGlintCUDA(cudaGetLastError());
     }
+    GLINT_TIME_BEGIN(FINALIZE);
     finalize_velocity<<<boid_blocks, threads, 0, simulation_stream>>>(num_boids, points_lst, dev_vel1, dev_vel2,
         position_sum, separation_sum, velocity_sum, cohesion_count, alignment_count);
+    GLINT_TIME_END(FINALIZE);
     checkGlintCUDA(cudaGetLastError());
 }
 
@@ -854,39 +903,55 @@ void GlintOctree::update_tree(cudaStream_t simulation_stream) {
     const int threads = GLINT_THREADS_PER_BLOCK;
     const int leaf_blocks = (host_num_active_leaves + threads - 1) / threads;
     const int parent_blocks = (host_num_potential_leaf_parents + threads - 1) / threads;
+    GLINT_TIME_BEGIN(TREE_RESET);
     checkGlintCUDA(cudaMemsetAsync(topology_changed, 0, sizeof(int), simulation_stream));
+    GLINT_TIME_END(TREE_RESET);
+    GLINT_TIME_BEGIN(SPLIT);
     split_node<<<leaf_blocks, threads, 0, simulation_stream>>>(host_num_active_leaves, active_leaves, node_lst, node_stk, node_stk_head, node_stk_tail, part_stk, part_stk_head, part_stk_tail, topology_changed, old_leaf_emit);
+    GLINT_TIME_END(SPLIT);
     checkGlintCUDA(cudaGetLastError());
     if (host_num_potential_leaf_parents > 0) {
+        GLINT_TIME_BEGIN(MERGE);
         merge_node<<<parent_blocks, threads, 0, simulation_stream>>>(host_num_potential_leaf_parents, potential_leaf_parents, node_lst, node_stk, node_stk_head, node_stk_tail, part_stk, part_stk_head, part_stk_tail, true, topology_changed);
+        GLINT_TIME_END(MERGE);
         checkGlintCUDA(cudaGetLastError());
     }
 
+    GLINT_TIME_BEGIN(TREE_FLAG);
     checkGlintCUDA(cudaMemcpyAsync(&host_topology_changed, topology_changed,
         sizeof(host_topology_changed), cudaMemcpyDeviceToHost, simulation_stream));
+    GLINT_TIME_END(TREE_FLAG);
     checkGlintCUDA(cudaStreamSynchronize(simulation_stream));
     if (!host_topology_changed) return;
 
+    GLINT_TIME_BEGIN(MERGE_EVENTS);
     update_leaf_merge_events<<<leaf_blocks, threads, 0, simulation_stream>>>(host_num_active_leaves,
         active_leaves, node_lst, leaf_parents, leafIsFirstChild, old_leaf_emit);
+    GLINT_TIME_END(MERGE_EVENTS);
     checkGlintCUDA(cudaGetLastError());
     // Generate both output counts on demand and scan them together over old leaves.
     auto output_counts = thrust::make_transform_iterator(thrust::make_counting_iterator(0),
         GetLeafOutputCounts{old_leaf_emit, leaf_parents, leafIsFirstChild});
+    GLINT_TIME_BEGIN(SCAN);
     checkGlintCUDA(cub::DeviceScan::ExclusiveScan(compact_temp, compact_temp_bytes,
         output_counts, old_leaf_offsets, AddLeafOutputCounts{},
         LeafOutputCounts{0, 0}, host_num_active_leaves, simulation_stream));
+    GLINT_TIME_END(SCAN);
+    GLINT_TIME_BEGIN(SCATTER);
     update_active_leaf_events<<<leaf_blocks, threads, 0, simulation_stream>>>(host_num_active_leaves,
         active_leaves, leaf_parents, leafIsFirstChild, node_lst,
         next_active_leaves, next_leaf_parents, next_leafIsFirstChild,
         next_num_active_leaves, old_leaf_offsets, old_leaf_emit,
         next_potential_leaf_parents, next_num_potential_leaf_parents);
+    GLINT_TIME_END(SCATTER);
     checkGlintCUDA(cudaGetLastError());
 
+    GLINT_TIME_BEGIN(LEAF_COUNTS);
     checkGlintCUDA(cudaMemcpyAsync(&host_num_active_leaves, next_num_active_leaves,
         sizeof(host_num_active_leaves), cudaMemcpyDeviceToHost, simulation_stream));
     checkGlintCUDA(cudaMemcpyAsync(&host_num_potential_leaf_parents, next_num_potential_leaf_parents,
         sizeof(host_num_potential_leaf_parents), cudaMemcpyDeviceToHost, simulation_stream));
+    GLINT_TIME_END(LEAF_COUNTS);
     checkGlintCUDA(cudaStreamSynchronize(simulation_stream));
     std::swap(active_leaves, next_active_leaves);
     std::swap(leaf_parents, next_leaf_parents);
@@ -899,3 +964,77 @@ void GlintOctree::update_tree(cudaStream_t simulation_stream) {
 #endif
 }
 
+#if DEBUG_GLINT_PIPELINE_TIMINGS || DEBUG_GLINT_TREE_UPDATES
+void GlintOctree::begin_debug_step() {
+    debug_step_active = true;
+#if DEBUG_GLINT_PIPELINE_TIMINGS
+    for (bool &recorded : timing_recorded) recorded = false;
+#endif
+}
+
+void GlintOctree::finish_debug_step() {
+    if (!debug_step_active) return;
+    ++debug_steps;
+    if (host_topology_changed) ++debug_tree_updates;
+    else ++debug_tree_unchanged;
+#if DEBUG_GLINT_PIPELINE_TIMINGS
+    for (int i = 0; i < GLINT_TIMING_COUNT; ++i) {
+        if (!timing_recorded[i]) continue;
+        float milliseconds = 0.0f;
+        checkGlintCUDA(cudaEventElapsedTime(&milliseconds, timing_start[i], timing_end[i]));
+        timing_totals[i] += milliseconds;
+    }
+#endif
+    debug_step_active = false;
+}
+
+void GlintOctree::print_debug_stats() {
+    if (!debug_steps) return;
+    std::ostringstream output;
+    output.setf(std::ios::fixed);
+    output.precision(3);
+#if DEBUG_GLINT_PIPELINE_TIMINGS
+    static constexpr const char *names[] = {
+        "leaf_reset", "filter_reset", "partition", "filter_count", "filter", "refine_count",
+        "accum_reset", "refinement", "finalize", "flag_reset", "split", "merge", "flag_read",
+        "merge_events", "scan", "scatter", "leaf_counts", "move",
+        "copy", "scan", "leaves"
+    };
+    static_assert(sizeof(names) / sizeof(names[0]) == GLINT_TIMING_COUNT);
+    auto print_stages = [&](int first, int last) {
+        for (int i = first; i <= last; ++i)
+            output << " | " << names[i] << " " << timing_totals[i] / debug_steps;
+    };
+    double total = 0.0;
+    for (double value : timing_totals) total += value;
+    output << "GLINT GPU ms/step (" << debug_steps << " steps)";
+    print_stages(GLINT_TIMING_LEAF_RESET, GLINT_TIMING_FINALIZE);
+    output << " | move " << timing_totals[GLINT_TIMING_MOVE] / debug_steps
+        << " | sum " << total / debug_steps << "\nGLINT tree GPU ms/step";
+    print_stages(GLINT_TIMING_TREE_RESET, GLINT_TIMING_LEAF_COUNTS);
+    output << "\nGLINT snapshot GPU ms/step";
+    print_stages(GLINT_TIMING_SNAPSHOT_COPY, GLINT_TIMING_SNAPSHOT_LEAVES);
+    output << "\n";
+    for (double &value : timing_totals) value = 0.0;
+#endif
+#if DEBUG_GLINT_TREE_UPDATES
+    output << "GLINT tree updates | with updates " << debug_tree_updates
+        << " | no updates " << debug_tree_unchanged << " | steps " << debug_steps << "\n";
+#endif
+    printf("%s", output.str().c_str());
+    debug_steps = debug_tree_updates = debug_tree_unchanged = 0;
+}
+#endif
+
+#if DEBUG_GLINT_PIPELINE_TIMINGS
+void GlintOctree::begin_debug_stage(TimingStage stage, cudaStream_t simulation_stream) {
+    if (!debug_step_active) return;
+    checkGlintCUDA(cudaEventRecord(timing_start[stage], simulation_stream));
+    timing_recorded[stage] = true;
+}
+
+void GlintOctree::end_debug_stage(TimingStage stage, cudaStream_t simulation_stream) {
+    if (!debug_step_active) return;
+    checkGlintCUDA(cudaEventRecord(timing_end[stage], simulation_stream));
+}
+#endif
