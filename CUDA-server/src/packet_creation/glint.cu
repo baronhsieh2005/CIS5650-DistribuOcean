@@ -97,9 +97,9 @@ __global__ void init_pools(GlintNode *node_lst, int *node_stk, unsigned int *nod
     if (i < PART_STK_MAX_SIZE) part_stk[i] = i;
     if (i == 0) {
         *node_stk_head = initial_node_count;
-        *node_stk_tail = NODE_STK_MAX_SIZE;
+        *node_stk_tail = NODE_STK_MAX_SIZE-1;
         *part_stk_head = 0;
-        *part_stk_tail = PART_STK_MAX_SIZE;
+        *part_stk_tail = PART_STK_MAX_SIZE-1;
     }
 }
 
@@ -336,27 +336,34 @@ __global__ void filter(int filter_lst_size, const FilterEntry *filter_lst,
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     extern __shared__ GlintOctree::FilterEntry stack[];
     __shared__ int stackSize;
+    __shared__ int popCount;
+    __shared__ int popBase;
     const int remaining = filter_lst_size - blockIdx.x * blockDim.x;
     const int seed_count = remaining < blockDim.x ? remaining : blockDim.x;
     FilterEntry *block_stk = get_block_stack(stack, &stackSize, seed_count);
     if (tid < filter_lst_size) block_stk[threadIdx.x] = filter_lst[tid];
 
     __syncthreads();
-    while (stackSize > 0) {
-        bool has_work = true;
-        int old = 0;
-        int assumed;
-        do {
-            assumed = stackSize;
-            if (assumed <= 0) {
-                has_work = false;
-                break;
-            }
-            old = atomicCAS(&stackSize, assumed, assumed-1);
-        } while (assumed != old);
+    while (true) {
+        if (threadIdx.x == 0) {
+            popCount = stackSize < blockDim.x ? stackSize : blockDim.x;
+            stackSize -= popCount;
+            popBase = stackSize;
+        }
+        __syncthreads();
+        
+        if (popCount == 0) {
+            break;
+        }
+        
+        const bool has_work = threadIdx.x < popCount;
+        FilterEntry entry;
+        if (has_work) {
+            entry = stack[popBase + threadIdx.x];
+        }
+        __syncthreads();
 
         if (has_work) {
-            FilterEntry entry = stack[old-1];
             int pid = entry.pid;
             GlintNode *nd = entry.node;
             const glm::vec3 position = points_lst[pid];
@@ -770,29 +777,29 @@ void GlintOctree::deletion() {
     host_filter_lst_size = host_refine_lst_size = 0;
 }
 
-void GlintOctree::update_partition(const glm::vec3 *dev_positions) {
+void GlintOctree::update_partition(const glm::vec3 *dev_positions, cudaStream_t simulation_stream) {
     points_lst = dev_positions;
 
     const int threads = GLINT_THREADS_PER_BLOCK;
     const int leaf_blocks = (host_num_active_leaves + threads - 1) / threads;
-    reset_leaf_count<<<leaf_blocks, threads>>>(host_num_active_leaves, active_leaves, node_lst);
+    reset_leaf_count<<<leaf_blocks, threads, 0, simulation_stream>>>(host_num_active_leaves, active_leaves, node_lst);
     checkGlintCUDA(cudaGetLastError());
 
     checkGlintCUDA(cudaMemset(filter_lst_size, 0, sizeof(int)));
     checkGlintCUDA(cudaMemset(refine_lst_size, 0, sizeof(int)));
-    partition<<<(num_boids + threads - 1) / threads, threads>>>(num_boids,
+    partition<<<(num_boids + threads - 1) / threads, threads, 0, simulation_stream>>>(num_boids,
         points_lst, node_lst, part_lst, filter_lst, filter_lst_size, refine_lst, refine_lst_size);
     checkGlintCUDA(cudaGetLastError());
 }
 
-void GlintOctree::update_filter() {
+void GlintOctree::update_filter(cudaStream_t simulation_stream) {
     const int threads = GLINT_THREADS_PER_BLOCK;
     checkGlintCUDA(cudaMemcpy(&host_filter_lst_size, filter_lst_size,
         sizeof(host_filter_lst_size), cudaMemcpyDeviceToHost));
     if (host_filter_lst_size > 0) {
         const int filter_blocks = (host_filter_lst_size + threads - 1) / threads;
         const size_t shared_bytes = GLINT_FILTER_STACK_CAPACITY * sizeof(FilterEntry);
-        filter<<<filter_blocks, threads, shared_bytes>>>(host_filter_lst_size,
+        filter<<<filter_blocks, threads, shared_bytes, simulation_stream>>>(host_filter_lst_size,
             filter_lst, points_lst, node_lst, refine_lst, refine_lst_size);
         checkGlintCUDA(cudaGetLastError());
     }
@@ -800,33 +807,33 @@ void GlintOctree::update_filter() {
         sizeof(host_refine_lst_size), cudaMemcpyDeviceToHost));
 }
 
-void GlintOctree::update_velocity(const glm::vec3 *dev_vel1, glm::vec3 *dev_vel2) {
+void GlintOctree::update_velocity(const glm::vec3 *dev_vel1, glm::vec3 *dev_vel2, cudaStream_t simulation_stream) {
     const int threads = GLINT_THREADS_PER_BLOCK;
     const int boid_blocks = (num_boids + threads - 1) / threads;
-    reset_interaction_accumulators<<<boid_blocks, threads>>>(num_boids,
+    reset_interaction_accumulators<<<boid_blocks, threads, 0, simulation_stream>>>(num_boids,
         position_sum, separation_sum, velocity_sum, cohesion_count, alignment_count);
     checkGlintCUDA(cudaGetLastError());
     if (host_refine_lst_size > 0) {
         const int refinement_blocks = (host_refine_lst_size + threads - 1) / threads;
-        refinement<<<refinement_blocks, threads>>>(host_refine_lst_size,
+        refinement<<<refinement_blocks, threads, 0, simulation_stream>>>(host_refine_lst_size,
             refine_lst, points_lst, part_lst, dev_vel1,
             position_sum, separation_sum, velocity_sum, cohesion_count, alignment_count);
         checkGlintCUDA(cudaGetLastError());
     }
-    finalize_velocity<<<boid_blocks, threads>>>(num_boids, points_lst, dev_vel1, dev_vel2,
+    finalize_velocity<<<boid_blocks, threads, 0, simulation_stream>>>(num_boids, points_lst, dev_vel1, dev_vel2,
         position_sum, separation_sum, velocity_sum, cohesion_count, alignment_count);
     checkGlintCUDA(cudaGetLastError());
 }
 
-void GlintOctree::update_tree() {
+void GlintOctree::update_tree(cudaStream_t simulation_stream) {
     const int threads = GLINT_THREADS_PER_BLOCK;
     const int leaf_blocks = (host_num_active_leaves + threads - 1) / threads;
     const int parent_blocks = (host_num_potential_leaf_parents + threads - 1) / threads;
     checkGlintCUDA(cudaMemset(topology_changed, 0, sizeof(int)));
-    split_node<<<leaf_blocks, threads>>>(host_num_active_leaves, active_leaves, node_lst, node_stk, node_stk_head, node_stk_tail, part_stk, part_stk_head, part_stk_tail, topology_changed, old_leaf_emit);
+    split_node<<<leaf_blocks, threads, 0, simulation_stream>>>(host_num_active_leaves, active_leaves, node_lst, node_stk, node_stk_head, node_stk_tail, part_stk, part_stk_head, part_stk_tail, topology_changed, old_leaf_emit);
     checkGlintCUDA(cudaGetLastError());
     if (host_num_potential_leaf_parents > 0) {
-        merge_node<<<parent_blocks, threads>>>(host_num_potential_leaf_parents, potential_leaf_parents, node_lst, node_stk, node_stk_head, node_stk_tail, part_stk, part_stk_head, part_stk_tail, true, topology_changed);
+        merge_node<<<parent_blocks, threads, 0, simulation_stream>>>(host_num_potential_leaf_parents, potential_leaf_parents, node_lst, node_stk, node_stk_head, node_stk_tail, part_stk, part_stk_head, part_stk_tail, true, topology_changed);
         checkGlintCUDA(cudaGetLastError());
     }
 
@@ -834,7 +841,7 @@ void GlintOctree::update_tree() {
         sizeof(host_topology_changed), cudaMemcpyDeviceToHost));
     if (!host_topology_changed) return;
 
-    update_leaf_merge_events<<<leaf_blocks, threads>>>(host_num_active_leaves,
+    update_leaf_merge_events<<<leaf_blocks, threads, 0, simulation_stream>>>(host_num_active_leaves,
         active_leaves, node_lst, leaf_parents, leafIsFirstChild, old_leaf_emit);
     checkGlintCUDA(cudaGetLastError());
     // Generate both output counts on demand and scan them together over old leaves.
@@ -842,8 +849,8 @@ void GlintOctree::update_tree() {
         GetLeafOutputCounts{old_leaf_emit, leaf_parents, leafIsFirstChild});
     checkGlintCUDA(cub::DeviceScan::ExclusiveScan(compact_temp, compact_temp_bytes,
         output_counts, old_leaf_offsets, AddLeafOutputCounts{},
-        LeafOutputCounts{0, 0}, host_num_active_leaves));
-    update_active_leaf_events<<<leaf_blocks, threads>>>(host_num_active_leaves,
+        LeafOutputCounts{0, 0}, host_num_active_leaves, simulation_stream));
+    update_active_leaf_events<<<leaf_blocks, threads, 0, simulation_stream>>>(host_num_active_leaves,
         active_leaves, leaf_parents, leafIsFirstChild, node_lst,
         next_active_leaves, next_leaf_parents, next_leafIsFirstChild,
         next_num_active_leaves, old_leaf_offsets, old_leaf_emit,

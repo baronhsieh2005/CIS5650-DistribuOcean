@@ -226,3 +226,112 @@ __global__ void gpicNodeProcessingNaive(Boids::GridSnapshot grid, uint32_t phone
     __syncthreads();
   }
 }
+
+
+__device__ bool glintLeafIsVisible(const Boids::GlintLeafSnapshot &leaf,
+    const Boids::CameraCullData &camera) {
+  const glm::vec3 center = (leaf.minimum + leaf.maximum) * 0.5f;
+  const glm::vec3 halfSize = (leaf.maximum - leaf.minimum) * 0.5f;
+  const glm::vec3 d = glm::max(glm::abs(center - camera.position) - halfSize,
+    glm::vec3(0.0f));
+  const float distanceSquared = glm::dot(d, d);
+#if CULL_TYPE == MIXED
+  const float innerRadius = Boids::cullDistance * mixedCullSphereFraction;
+  if (distanceSquared <= innerRadius * innerRadius * (1.0f + 0.000001f)) return true;
+#endif
+  const float radius = Boids::cullDistance + cullDistanceTolerance;
+  if (distanceSquared > radius * radius * (1.0f + 0.000001f)) return false;
+#if CULL_TYPE == DIST_SPHERE
+  return true;
+#else
+  const float halfWidth = fmaxf(halfSize.x, fmaxf(halfSize.y, halfSize.z));
+#if CULL_TYPE == DIST_VIEW
+  return cellIntersectsFrustum(center, halfWidth, camera, 0.0f);
+#elif CULL_TYPE == MIXED
+  return cellIntersectsFrustum(center, halfWidth, camera, cullFrustumTolerance);
+#endif
+#endif
+}
+
+__global__ void gpicCullQueryRegisteringGridGlint(Boids::GlintSnapshot glint,
+    uint32_t phoneCount, const Boids::CameraCullData *cameras, uint32_t *cellCameraMasks) {
+  const uint32_t cellIdx = threadIdx.x + blockIdx.x * blockDim.x;
+  const uint32_t cameraIdx = threadIdx.y + blockIdx.y * blockDim.y;
+  if (cellIdx >= glint.leafCount || cameraIdx >= phoneCount ||
+      glint.leaves[cellIdx].numBoids == 0) return;
+  const uint32_t intsPerCell = (phoneCount + 31) / 32;
+  if (glintLeafIsVisible(glint.leaves[cellIdx], cameras[cameraIdx])) {
+    atomicOr(&cellCameraMasks[static_cast<size_t>(cellIdx) * intsPerCell + cameraIdx / 32],
+      1u << (cameraIdx % 32));
+  }
+}
+
+__global__ void gpicNodeProcessingGlint(Boids::GlintSnapshot glint, uint32_t phoneCount,
+    const uint32_t *cellCameraMasks, const glm::vec3 *positions,
+    const Boids::CameraCullData *cameras, int32_t *visibleCounts,
+    uint32_t **selectedIndicesByPhone) {
+  const uint32_t cellIdx = blockIdx.x;
+  if (cellIdx >= glint.leafCount) return;
+
+  const auto leaf = glint.leaves[cellIdx];
+  if (leaf.numBoids == 0) return;
+  const int start = leaf.startIndex;
+
+  const uint32_t warpIdx = threadIdx.x / 32;
+  const uint32_t laneIdx = threadIdx.x % 32;
+  const uint32_t warpsPerBlock = blockDim.x / 32;
+  const uint32_t intsPerCell = (phoneCount + 31) / 32;
+
+  extern __shared__ glm::vec3 boidPositions[];
+  uint32_t *registeredCameras = reinterpret_cast<uint32_t *>(boidPositions + GPIC_SMEM_TILE_SIZE);
+  __shared__ uint32_t registeredCount;
+  if (threadIdx.x == 0) {
+    uint32_t count = 0;
+    for (uint32_t word = 0; word < intsPerCell; ++word) {
+      uint32_t mask = cellCameraMasks[static_cast<size_t>(cellIdx) * intsPerCell + word];
+      while (mask != 0) {
+        const uint32_t bit = __ffs(mask) - 1;
+        const uint32_t phoneIdx = word * 32 + bit;
+        if (phoneIdx < phoneCount) registeredCameras[count++] = phoneIdx;
+        mask &= mask - 1;
+      }
+    }
+    registeredCount = count;
+  }
+  __syncthreads();
+  if (registeredCount == 0) return;
+
+  const int end = start + leaf.numBoids - 1;
+  for (int tileStart = start; tileStart <= end; tileStart += GPIC_SMEM_TILE_SIZE) {
+    const int tileCount = imin(GPIC_SMEM_TILE_SIZE, end - tileStart + 1);
+    for (int i = threadIdx.x; i < tileCount; i += blockDim.x) {
+      boidPositions[i] = positions[glint.boidIndices[tileStart + i]];
+    }
+    __syncthreads();
+
+    for (uint32_t query = warpIdx; query < registeredCount; query += warpsPerBlock) {
+      const uint32_t phoneIdx = registeredCameras[query];
+      const Boids::CameraCullData camera = cameras[phoneIdx];
+      for (int first = 0; first < tileCount; first += 32) {
+        const int i = first + laneIdx;
+        float distanceToCamera;
+        const bool visible = i < tileCount &&
+          shouldBoidSurviveNaive(i, boidPositions, camera, &distanceToCamera);
+        const uint32_t mask = __ballot_sync(0xFFFFFFFFu, visible);
+        if (mask == 0) continue;
+        int32_t firstRank = 0;
+        if (laneIdx == 0) {
+          firstRank = atomicAdd(visibleCounts + phoneIdx, __popc(mask));
+        }
+        firstRank = __shfl_sync(0xFFFFFFFFu, firstRank, 0);
+        if (visible) {
+          const int32_t rank = firstRank + __popc(mask & ((1u << laneIdx) - 1u));
+          if (rank < MAX_BOIDS_PER_PHONE) {
+            selectedIndicesByPhone[phoneIdx][rank] = glint.boidIndices[tileStart + i];
+          }
+        }
+      }
+    }
+    __syncthreads();
+  }
+}

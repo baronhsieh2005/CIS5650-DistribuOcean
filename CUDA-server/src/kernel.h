@@ -22,6 +22,20 @@ namespace Boids {
     };
     GridSnapshot getNetworkGridSnapshot();
 
+    struct GlintLeafSnapshot {
+        glm::vec3 minimum;
+        glm::vec3 maximum;
+        uint32_t startIndex;
+        uint32_t numBoids;
+        int nodeIndex;
+    };
+    struct GlintSnapshot {
+        const GlintLeafSnapshot *leaves;
+        const uint32_t *boidIndices;
+        uint32_t leafCount;
+    };
+    GlintSnapshot getNetworkGlintSnapshot();
+
     struct ViewPositionEncoding {
         uint8_t x_pos;
         uint8_t y_pos;
@@ -58,6 +72,7 @@ namespace Boids {
     void initSimulation(int N);
     void stepSimulationCoherentGrid(float dt, const CameraCullData *cameras,
                                    bool *cameraChanged, uint32_t phoneCount);
+    void stepSimulationGlint(float dt, CameraCullData *cameras, bool *cameraChanged, uint32_t phoneCount);
     void initializeNetworkPhones(const CameraCullData *cameras, uint32_t phoneCount);
     void createNetworkPackets();
     void cullBoidsByCameras(const CameraCullData *cameras, bool *cameraChanged,

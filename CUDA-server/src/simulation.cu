@@ -4,6 +4,7 @@
 #include <math_constants.h>
 #include "kernel.h"
 #include "utilityCore.hpp"
+#include "packet_creation/glint.h"
 
 #include <cmath>
 #include <cstdio>
@@ -14,6 +15,7 @@
 #include <thrust/device_ptr.h>
 #include <thrust/execution_policy.h>
 #include <thrust/iterator/counting_iterator.h>
+#include <thrust/iterator/transform_iterator.h>
 #include <thrust/random.h>
 #include <cub/cub.cuh>
 
@@ -84,6 +86,42 @@ glm::vec3 gridMinimum;
 
 cudaStream_t simulation_stream;
 cudaEvent_t simulationSnapshotReadyEvent;
+
+GlintOctree glintOctree;
+
+#if SIMULATION_TYPE == GLINT_SIMULATION
+Boids::GlintLeafSnapshot *dev_glintLeaves_snapshot = nullptr;
+uint32_t *dev_glintBoidIndices_snapshot = nullptr;
+int *dev_glintLeafOffsets_snapshot = nullptr;
+void *glintSnapshotScanTemp = nullptr;
+size_t glintSnapshotScanTempBytes = 0;
+uint32_t glintSnapshotLeafCount = 0;
+
+struct GetGlintLeafSize {
+  const int *active_leaves;
+  const GlintOctree::GlintNode *nodes;
+  __host__ __device__ int operator()(int leafIdx) const {
+    return nodes[active_leaves[leafIdx]].size;
+  }
+};
+
+__global__ void kernSnapshotGlintLeaves(int leafCount, const int *active_leaves,
+    const GlintOctree::GlintNode *nodes, const GlintOctree::PartitionBuff *partitions,
+    const int *offsets, Boids::GlintLeafSnapshot *leaves, uint32_t *boidIndices) {
+  const int leafIdx = blockIdx.x;
+  if (leafIdx >= leafCount) return;
+  const int nodeIdx = active_leaves[leafIdx];
+  const auto &node = nodes[nodeIdx];
+  const int start = offsets[leafIdx];
+  if (threadIdx.x == 0) {
+    leaves[leafIdx] = {node.min_coords, node.max_coords,
+      static_cast<uint32_t>(start), static_cast<uint32_t>(node.size), nodeIdx};
+  }
+  for (int i = threadIdx.x; i < node.size; i += blockDim.x) {
+    boidIndices[start + i] = partitions[node.part_idx].boid_idx[i];
+  }
+}
+#endif
 
 /******************
 * initSimulation *
@@ -223,6 +261,22 @@ void Boids::initSimulation(int N) {
   dev_thrust_pos2 = thrust::device_pointer_cast(dev_pos2);
   dev_thrust_boidIds = thrust::device_pointer_cast(dev_boidIds);
   dev_thrust_boidIds2 = thrust::device_pointer_cast(dev_boidIds2);
+
+#if SIMULATION_TYPE == GLINT_SIMULATION
+  cudaStreamSynchronize(simulation_stream);
+  glintOctree.init(N, dev_pos);
+  cudaMalloc((void **)&dev_glintLeaves_snapshot,
+    NODE_STK_MAX_SIZE * sizeof(GlintLeafSnapshot));
+  cudaMalloc((void **)&dev_glintBoidIndices_snapshot, N * sizeof(uint32_t));
+  cudaMalloc((void **)&dev_glintLeafOffsets_snapshot, NODE_STK_MAX_SIZE * sizeof(int));
+  const auto leafData = glintOctree.get_leaf_data();
+  auto leafSizes = thrust::make_transform_iterator(thrust::make_counting_iterator(0),
+    GetGlintLeafSize{leafData.active_leaves, leafData.nodes});
+  cub::DeviceScan::ExclusiveSum(nullptr, glintSnapshotScanTempBytes, leafSizes,
+    dev_glintLeafOffsets_snapshot, NODE_STK_MAX_SIZE, simulation_stream);
+  cudaMalloc(&glintSnapshotScanTemp, glintSnapshotScanTempBytes);
+  checkCUDAErrorWithLine("allocate network GLINT snapshot failed!");
+#endif
 
   cudaStreamSynchronize(simulation_stream);
 }
@@ -555,28 +609,93 @@ void Boids::stepSimulationCoherentGrid(float dt, const CameraCullData *cameras,
     cudaStreamSynchronize(simulation_stream);
 }
 
+void Boids::stepSimulationGlint(float dt, CameraCullData *cameras, bool *cameraChanged, uint32_t phoneCount) {
+  dim3 fullBlocksPerGrid((numObjects + blockSize - 1) / blockSize);
+    int gridResolution = gridSideCount;
+
+    glintOctree.update_partition(dev_pos, simulation_stream);
+
+    bool requestPacket = false;
+    {
+      std::lock_guard<std::mutex> lock(ready_request_network_packet_lock);
+      if (phoneCount != 0 && ready_request_network_packet) {
+        ready_request_network_packet = false;
+        requestPacket = true;
+      }
+    }
+    if (requestPacket) {
+      requestNetworkPacket(cameras, cameraChanged, phoneCount);
+    }
+
+    glintOctree.update_filter(simulation_stream);
+    glintOctree.update_velocity(dev_vel1, dev_vel2, simulation_stream);
+    glintOctree.update_tree(simulation_stream);
+
+    std::swap(dev_vel1, dev_vel2);
+    kernUpdatePos<<<fullBlocksPerGrid, blockSize, 0, simulation_stream>>>(numObjects, dt, dev_pos, dev_vel1);
+    checkCUDAErrorWithLine("kernUpdatePos failed!");
+  
+    cudaStreamSynchronize(simulation_stream);
+}
+
 Boids::GridSnapshot Boids::getNetworkGridSnapshot() {
   return {dev_gridStarts_snapshot, dev_gridEnds_snapshot,
     static_cast<uint32_t>(gridCellCount), static_cast<uint32_t>(gridSideCount),
     gridCellWidth, gridMinimum};
 }
 
+#if SIMULATION_TYPE == GLINT_SIMULATION
+Boids::GlintSnapshot Boids::getNetworkGlintSnapshot() {
+  return {dev_glintLeaves_snapshot, dev_glintBoidIndices_snapshot, glintSnapshotLeafCount};
+}
+#else
+Boids::GlintSnapshot Boids::getNetworkGlintSnapshot() {
+  return {};
+}
+#endif
+
 void Boids::prepareSimulationSnapshotsForNetwork() {
-    // Only called at the post-gather/pre-movement simulation boundary.
     cudaMemcpyAsync(dev_pos_snapshot, dev_pos, numObjects * sizeof(glm::vec3),
       cudaMemcpyDeviceToDevice, simulation_stream);
+
+  #if SIMULATION_TYPE == GRID_SIMULATION
     cudaMemcpyAsync(dev_boidIds_snapshot, dev_boidIds, numObjects * sizeof(uint32_t),
       cudaMemcpyDeviceToDevice, simulation_stream);
     cudaMemcpyAsync(dev_gridStarts_snapshot, dev_gridCellStartIndices,
       gridCellCount * sizeof(int), cudaMemcpyDeviceToDevice, simulation_stream);
     cudaMemcpyAsync(dev_gridEnds_snapshot, dev_gridCellEndIndices,
       gridCellCount * sizeof(int), cudaMemcpyDeviceToDevice, simulation_stream);
-    cudaEventRecord(simulationSnapshotReadyEvent, simulation_stream);
+  #elif SIMULATION_TYPE == GLINT_SIMULATION
+    const auto leafData = glintOctree.get_leaf_data();
+    glintSnapshotLeafCount = leafData.count;
+    auto leafSizes = thrust::make_transform_iterator(thrust::make_counting_iterator(0),
+      GetGlintLeafSize{leafData.active_leaves, leafData.nodes});
+    cub::DeviceScan::ExclusiveSum(glintSnapshotScanTemp, glintSnapshotScanTempBytes,
+      leafSizes, dev_glintLeafOffsets_snapshot, glintSnapshotLeafCount, simulation_stream);
+    kernSnapshotGlintLeaves<<<glintSnapshotLeafCount, blockSize, 0, simulation_stream>>>(
+      glintSnapshotLeafCount, leafData.active_leaves, leafData.nodes, leafData.partitions,
+      dev_glintLeafOffsets_snapshot, dev_glintLeaves_snapshot, dev_glintBoidIndices_snapshot);
+    checkCUDAErrorWithLine("snapshot GLINT leaves failed!");
+  #endif
+      cudaEventRecord(simulationSnapshotReadyEvent, simulation_stream);
 }
 
 void releaseNetworkBuffers();
 
 void Boids::endSimulation() {
+  cudaStreamSynchronize(simulation_stream);
+#if SIMULATION_TYPE == GLINT_SIMULATION
+  glintOctree.deletion();
+  cudaFree(dev_glintLeaves_snapshot);
+  cudaFree(dev_glintBoidIndices_snapshot);
+  cudaFree(dev_glintLeafOffsets_snapshot);
+  cudaFree(glintSnapshotScanTemp);
+  dev_glintLeaves_snapshot = nullptr;
+  dev_glintBoidIndices_snapshot = nullptr;
+  dev_glintLeafOffsets_snapshot = nullptr;
+  glintSnapshotScanTemp = nullptr;
+  glintSnapshotLeafCount = 0;
+#endif
   cudaFree(dev_vel1);
   cudaFree(dev_vel2);
   cudaFree(dev_boidIds);

@@ -282,9 +282,13 @@ void initShaders(GLuint * program) {
     cudaGLMapBufferObject((void**)&dptrVertVelocities, boidVBO_velocities);
 #endif
 
+#if SIMULATION_TYPE == GRID_SIMULATION
     Boids::stepSimulationCoherentGrid(DT, networkCameras.data(), networkCameraChanged.get(),
       static_cast<uint32_t>(networkCameras.size()));
-
+#elif SIMULATION_TYPE == GLINT_SIMULATION
+    Boids::stepSimulationGlint(DT, networkCameras.data(), networkCameraChanged.get(),
+      static_cast<uint32_t>(networkCameras.size()));
+#endif
     const double currentTime = simulationClockSeconds();
 #if !VISUALIZE || DEBUG_MODE
     static double rateSampleStartTime = currentTime;

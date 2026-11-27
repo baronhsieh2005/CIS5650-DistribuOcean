@@ -5,6 +5,9 @@
 #include "kernel.h"
 #include "compact.cuh"
 #include "culling.h"
+#if CULLING_TYPE == GPIC_GLINT_CULLING
+#include "glint.h"
+#endif
 #include "utilityCore.hpp"
 
 #include <cmath>
@@ -316,9 +319,13 @@ void Boids::initializeNetworkPhones(const CameraCullData *cameras, uint32_t phon
 
   cudaMalloc((void **)&dev_networkCameras, phoneCount * sizeof(Boids::CameraCullData));
   checkCUDAErrorWithLine("cudaMalloc network cameras failed!");
-  const auto grid = getNetworkGridSnapshot();
+#if CULLING_TYPE == GPIC_GLINT_CULLING
+  const size_t cellCount = NODE_STK_MAX_SIZE;
+#else
+  const size_t cellCount = getNetworkGridSnapshot().cellCount;
+#endif
   cudaMalloc((void **)&dev_cellCameraMasks,
-    static_cast<size_t>(grid.cellCount) * ((phoneCount + 31) / 32) * sizeof(uint32_t));
+    cellCount * ((phoneCount + 31) / 32) * sizeof(uint32_t));
   checkCUDAErrorWithLine("cudaMalloc cell camera masks failed!");
   cudaMemcpyAsync(dev_networkCameras, cameras, phoneCount * sizeof(Boids::CameraCullData),
     cudaMemcpyHostToDevice, network_stream);
@@ -502,7 +509,10 @@ __device__ glm::vec3 encodeNewBoidPosition(Boids::NewBoidData &boidNewData,
 }
 
 __global__ void kernBuildNetworkPackets(uint32_t phoneCount, uint32_t currentEpoch,
-  const glm::vec3 *boidPositions, const uint32_t *boidIds,
+  const glm::vec3 *boidPositions, 
+#if SIMULATION_TYPE != GLINT_SIMULATION
+  const uint32_t *boidIds,
+#endif
   uint32_t **selectedBoidIndicesByPhone, const int32_t *visibleLastIndices,
   int **boidSlotInPacketByPhone, glm::vec3 **clientPositionsByPhone,
   Boids::UpdateBoidData **boidUpdatePackets, Boids::NewBoidData **boidNewPackets,
@@ -520,7 +530,11 @@ __global__ void kernBuildNetworkPackets(uint32_t phoneCount, uint32_t currentEpo
   }
 
   const uint32_t currentBoidIndex = selectedBoidIndicesByPhone[phoneIndex][selectedRank];
+#if SIMULATION_TYPE == GLINT_SIMULATION
+  const uint32_t stableBoidId = currentBoidIndex;
+#else
   const uint32_t stableBoidId = boidIds[currentBoidIndex];
+#endif
   const int slotInPacket = boidSlotInPacketByPhone[phoneIndex][stableBoidId];
   if (slotInPacket > -1) {
     newBoidFlagsByPhone[phoneIndex][selectedRank] = 0;
@@ -575,7 +589,10 @@ __global__ void kernClearFreePacketSlots(uint32_t phoneCount, uint32_t currentEp
 }
 
 __global__ void kernAssignNewPacketSlots(uint32_t phoneCount, uint32_t currentEpoch,
-  const glm::vec3 *boidPositions, const uint32_t *boidIds,
+  const glm::vec3 *boidPositions, 
+#if SIMULATION_TYPE != GLINT_SIMULATION
+  const uint32_t *boidIds,
+#endif
   const Boids::CameraCullData *cameras, uint32_t **selectedBoidIndicesByPhone,
   uint32_t **newRanksByPhone, const uint32_t *newCounts,
   uint32_t **freeSlotsByPhone, const uint32_t *freeCounts,
@@ -593,7 +610,12 @@ __global__ void kernAssignNewPacketSlots(uint32_t phoneCount, uint32_t currentEp
   const uint32_t selectedRank = newRanksByPhone[phoneIndex][newIndex];
   const uint32_t slot = freeSlotsByPhone[phoneIndex][newIndex];
   const uint32_t currentBoidIndex = selectedBoidIndicesByPhone[phoneIndex][selectedRank];
+
+#if SIMULATION_TYPE == GLINT_SIMULATION
+  const uint32_t stableBoidId = currentBoidIndex;
+#else
   const uint32_t stableBoidId = boidIds[currentBoidIndex];
+#endif
 
   boidSlotInPacketByPhone[phoneIndex][stableBoidId] = static_cast<int>(slot);
   boidIdBySlotInPacket[phoneIndex][slot] = stableBoidId;
@@ -656,6 +678,15 @@ void Boids::createNetworkPackets() {
   gpicCullQueryRegisteringGrid<<<registrationBlocks, registrationThreads, 0, network_stream>>>(
     grid, networkPhoneCount, dev_networkCameras, dev_cellCameraMasks);
   checkCUDAErrorWithLine("G-PICS grid registration failed!");
+#elif CULLING_TYPE == GPIC_GLINT_CULLING
+    const auto glint_snap = getNetworkGlintSnapshot();
+    cudaMemsetAsync(dev_cellCameraMasks, 0, static_cast<size_t>(glint_snap.leafCount) * ((networkPhoneCount + 31) / 32) * sizeof(uint32_t),
+    network_stream);
+    const dim3 registrationThreads(32, 4);
+    const dim3 registrationBlocks((glint_snap.leafCount + 31) / 32, (networkPhoneCount + 3) / 4);
+    gpicCullQueryRegisteringGridGlint<<<registrationBlocks, registrationThreads, 0, network_stream>>>(
+      glint_snap, networkPhoneCount, dev_networkCameras, dev_cellCameraMasks);
+    checkCUDAErrorWithLine("G-PICS GLINT leaf registration failed!");
 #endif
 #if DEBUG_NETWORK_PIPELINE_TIMINGS
   cudaEventRecord(networkTimingEvents[NETWORK_TIMING_REGISTER], network_stream);
@@ -670,6 +701,13 @@ void Boids::createNetworkPackets() {
     dev_cellCameraMasks, dev_pos_snapshot, dev_networkCameras,
     dev_phoneVisibleCounts, dev_phoneSelectedBoidIndices);
   checkCUDAErrorWithLine("G-PICS node processing failed!");
+#elif CULLING_TYPE == GPIC_GLINT_CULLING
+ const size_t nodeSharedBytes = GPIC_SMEM_TILE_SIZE * sizeof(glm::vec3) +
+    static_cast<size_t>(networkPhoneCount) * sizeof(uint32_t);
+  gpicNodeProcessingGlint<<<glint_snap.leafCount, blockSize, nodeSharedBytes, network_stream>>>(
+    glint_snap, networkPhoneCount, dev_cellCameraMasks, dev_pos_snapshot, dev_networkCameras,
+    dev_phoneVisibleCounts, dev_phoneSelectedBoidIndices);
+  checkCUDAErrorWithLine("G-PICS GLINT leaf processing failed!");
 #else
   dim3 blocksPerGrid((numObjects + blockSize - 1) / blockSize);
   kernCullBoidsByCameras<<<blocksPerGrid, blockSize, 0, network_stream>>>(numObjects, dev_pos_snapshot,
@@ -690,10 +728,17 @@ void Boids::createNetworkPackets() {
   const uint32_t packetWorkItems = networkPhoneCount * MAX_BOIDS_PER_PHONE;
   dim3 packetBlocksPerGrid((packetWorkItems + blockSize - 1) / blockSize);
   const uint32_t currentEpoch = networkEpoch++;
+#if SIMULATION_TYPE == GLINT_SIMULATION
+  kernBuildNetworkPackets<<<packetBlocksPerGrid, blockSize, 0, network_stream>>>(networkPhoneCount,
+    currentEpoch, dev_pos_snapshot, dev_phoneSelectedBoidIndices, dev_phoneVisibleCounts,
+    dev_boidSlotInPacketByPhone, dev_clientPositionsByPhone, dev_boidUpdatePackets,
+    dev_boidNewPackets, dev_packetEpochsByPhone, dev_newBoidFlagsByPhone);
+#else
   kernBuildNetworkPackets<<<packetBlocksPerGrid, blockSize, 0, network_stream>>>(networkPhoneCount,
     currentEpoch, dev_pos_snapshot, dev_boidIds_snapshot, dev_phoneSelectedBoidIndices, dev_phoneVisibleCounts,
     dev_boidSlotInPacketByPhone, dev_clientPositionsByPhone, dev_boidUpdatePackets,
     dev_boidNewPackets, dev_packetEpochsByPhone, dev_newBoidFlagsByPhone);
+#endif
   checkCUDAErrorWithLine("kernBuildNetworkPackets failed!");
 #if DEBUG_NETWORK_PIPELINE_TIMINGS
   cudaEventRecord(networkTimingEvents[NETWORK_TIMING_BUILD_EXISTING], network_stream);
@@ -748,7 +793,11 @@ void Boids::createNetworkPackets() {
 #endif
 
   kernAssignNewPacketSlots<<<packetBlocksPerGrid, blockSize, 0, network_stream>>>(networkPhoneCount,
-    currentEpoch, dev_pos_snapshot, dev_boidIds_snapshot, dev_networkCameras, dev_phoneSelectedBoidIndices,
+    currentEpoch, dev_pos_snapshot,
+#if SIMULATION_TYPE != GLINT_SIMULATION
+    dev_boidIds_snapshot,
+#endif
+    dev_networkCameras, dev_phoneSelectedBoidIndices,
     dev_newRanksByPhone, dev_phoneNewCounts, dev_freeSlotsByPhone, dev_phoneFreeCounts,
     dev_boidSlotInPacketByPhone, dev_boidIdBySlotInPacket, dev_packetEpochsByPhone,
     dev_clientPositionsByPhone, dev_boidNewPackets);

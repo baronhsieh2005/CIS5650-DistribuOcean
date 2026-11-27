@@ -3,9 +3,9 @@
 #include <cstdint>
 
 // Scene and camera setup.
-inline constexpr int N_FOR_VIS = 200000;
+inline constexpr int N_FOR_VIS = 150000;
 inline constexpr float DT = 0.2f;
-inline constexpr uint32_t NUM_VIRTUAL_CAMERAS = 20;
+inline constexpr uint32_t NUM_VIRTUAL_CAMERAS = 100;
 // Camera offsets within the interior of the boids' starting regions.
 inline constexpr float VIRTUAL_CAMERA_POSITION_EXTENT = 45.0f;
 inline constexpr uint32_t VIRTUAL_CAMERA_RANDOM_SEED = 5650;
@@ -16,7 +16,6 @@ inline constexpr double NETWORK_UPDATE_INTERVAL_SECONDS = 1.0 / 20.0;
 
 // Simulation and shared CUDA launch configuration.
 inline constexpr int blockSize = 128;
-// Number of positions cached per G-PICS shared-memory tile.
 #define GPIC_SMEM_TILE_SIZE 128
 #define rule1Distance 15.0f
 #define rule2Distance 9.0f
@@ -28,11 +27,18 @@ inline constexpr int blockSize = 128;
 #define scene_scale 300.0f
 #define spawnFlockRadius 90.0f
 
+#define GRID_SIMULATION 0
+#define GLINT_SIMULATION 1
+#ifndef SIMULATION_TYPE
+#define SIMULATION_TYPE GRID_SIMULATION
+#endif
+
 // Culling implementation and visibility predicate are independent choices.
 #define NAIVE_CULLING 0
 #define GPIC_CULLING 1
+#define GPIC_GLINT_CULLING 2
 #ifndef CULLING_TYPE
-#define CULLING_TYPE NAIVE_CULLING
+#define CULLING_TYPE GPIC_CULLING
 #endif
 
 #define DIST_VIEW 0

@@ -3,9 +3,9 @@
 // Initial tuning values; physical capacity is separate from split/merge thresholds.
 #define ROOT_NODE_IDX 0
 #define NO_PARTITION (-1)
-#define NUM_BOIDS_PER_PARTITION 64
-#define PARTITION_GRANULARITY_SPLIT 50
-#define PARTITION_GRANULARITY_MERGE 25
+#define NUM_BOIDS_PER_PARTITION 256
+#define PARTITION_GRANULARITY_SPLIT 128
+#define PARTITION_GRANULARITY_MERGE 64
 #define NODE_STK_MAX_SIZE 65536
 #define PART_STK_MAX_SIZE 65536
 #define GLINT_INITIAL_MAX_DEPTH 5
@@ -69,6 +69,25 @@ public:
         uint32_t boid_idx[NUM_BOIDS_PER_PARTITION];
     };
 
+    struct LeafData {
+        const GlintNode *nodes;
+        const PartitionBuff *partitions;
+        const int *active_leaves;
+        int count;
+    };
+    LeafData get_leaf_data() const {
+        return {node_lst, part_lst, active_leaves, host_num_active_leaves};
+    }
+
+    void init(int boid_count, const glm::vec3 *device_positions,
+        int depth = GLINT_INITIAL_MAX_DEPTH);
+    void deletion();
+
+    void update_partition(const glm::vec3 *dev_positions, cudaStream_t simulation_stream);
+    void update_filter(cudaStream_t simulation_stream);
+    void update_velocity(const glm::vec3 *dev_vel1, glm::vec3 *dev_vel2, cudaStream_t simulation_stream);
+    void update_tree(cudaStream_t simulation_stream);
+private:
     // Borrowed simulation positions; all other device allocations below are owned.
     const glm::vec3 *points_lst = nullptr;
     GlintNode *node_lst = nullptr;
@@ -116,59 +135,4 @@ public:
     int num_boids = 0;
     int max_depth = 0;
     int initial_node_count = 0;
-
-    void init(int boid_count, const glm::vec3 *device_positions,
-        int depth = GLINT_INITIAL_MAX_DEPTH);
-    void deletion();
-    // Run these stages in order, with snapshots/queries before update_tree.
-    void update_partition(const glm::vec3 *dev_positions);
-    void update_filter();
-    void update_velocity(const glm::vec3 *dev_vel1, glm::vec3 *dev_vel2);
-    void update_tree();
 };
-
-__device__ int getChildFromPos(const glm::vec3 &position,
-    const GlintOctree::GlintNode *node);
-// Both helpers return squared distances. Boundary distance assumes an interior point.
-__device__ float get_distance(const glm::vec3 &position,
-    const GlintOctree::GlintNode *node);
-__device__ float getMinDistToNode(const glm::vec3 &position,
-    const GlintOctree::GlintNode *node);
-// Returns -1 for the root or a node not reachable in the current topology.
-__device__ int get_parent(int node_idx, const GlintOctree::GlintNode *node_lst);
-__global__ void build_init_octree(int num_nodes, int max_depth, GlintOctree::GlintNode *node_lst);
-__global__ void init_partition(int num_boids, const glm::vec3 *points_lst, GlintOctree::GlintNode *node_lst);
-__global__ void init_leaves(int num_nodes, GlintOctree::GlintNode *node_lst, int *part_stk, unsigned int *part_stk_head, unsigned int *part_stk_tail, uint8_t *active_leaf_map, uint8_t *potential_leaf_parent_map);
-__global__ void partition(int num_boids, const glm::vec3 *points_lst,
-    GlintOctree::GlintNode *node_lst, GlintOctree::PartitionBuff *part_lst,
-    GlintOctree::FilterEntry *filter_lst, int *filter_lst_size,
-    GlintOctree::RefinePair *refine_lst, int *refine_lst_size);
-__device__ GlintOctree::FilterEntry *get_block_stack(
-    GlintOctree::FilterEntry *storage, int *stack_size, int seed_count);
-__global__ void filter(int filter_lst_size, const GlintOctree::FilterEntry *filter_lst,
-    const glm::vec3 *points_lst, GlintOctree::GlintNode *node_lst,
-    GlintOctree::RefinePair *refine_lst, int *refine_lst_size);
-__global__ void reset_interaction_accumulators(int num_boids, glm::vec3 *position_sum,
-    glm::vec3 *separation_sum, glm::vec3 *velocity_sum, int *cohesion_count, int *alignment_count);
-__global__ void refinement(int num_pairs, const GlintOctree::RefinePair *refine_lst,
-    const glm::vec3 *points_lst, const GlintOctree::PartitionBuff *part_lst,
-    const glm::vec3 *vel1, glm::vec3 *position_sum, glm::vec3 *separation_sum,
-    glm::vec3 *velocity_sum, int *cohesion_count, int *alignment_count);
-__global__ void finalize_velocity(int num_boids, const glm::vec3 *points_lst,
-    const glm::vec3 *vel1, glm::vec3 *vel2, const glm::vec3 *position_sum,
-    const glm::vec3 *separation_sum, const glm::vec3 *velocity_sum,
-    const int *cohesion_count, const int *alignment_count);
-__global__ void split_node(int num_active_leaves, int *active_leaves, GlintOctree::GlintNode *node_lst, int *node_stk, unsigned int *node_stk_head, unsigned int *node_stk_tail, int *part_stk, unsigned int *part_stk_head, unsigned int *part_stk_tail, int *topology_changed, int *old_leaf_emit);
-__global__ void merge_node(int num_potential_leaf_parents, const int *potential_leaf_parents, GlintOctree::GlintNode *node_lst, int *node_stk, unsigned int *node_stk_head, unsigned int *node_stk_tail, int *part_stk, unsigned int *part_stk_head, unsigned int *part_stk_tail, bool alloc_partition, int *topology_changed);
-__global__ void merge_depth(int first_node, int node_count, GlintOctree::GlintNode *node_lst, int *node_stk, unsigned int *node_stk_head, unsigned int *node_stk_tail, int *part_stk, unsigned int *part_stk_head, unsigned int *part_stk_tail, bool alloc_partition);
-
-__global__ void reset_leaf_count(int num_active_leaves, const int *active_leaves, GlintOctree::GlintNode *node_lst);
-
-__global__ void update_leaf_merge_events(int num_active_leaves, int *active_leaves,
-    GlintOctree::GlintNode *node_lst, int *leaf_parents, uint8_t *leafIsFirstChild, int *old_leaf_emit);
-
-__global__ void update_active_leaf_events(int num_active_leaves, const int *active_leaves,
-    const int *leaf_parents, const uint8_t *leafIsFirstChild, const GlintOctree::GlintNode *node_lst,
-    int *new_active_leaves, int *new_leaf_parents, uint8_t *new_leafIsFirstChild,
-    int *new_num_active_leaves, const GlintOctree::LeafOutputCounts *new_idx, const int *old_leaf_emit,
-    int *new_potential_leaf_parents, int *new_num_potential_leaf_parents);
