@@ -3,14 +3,14 @@
 #include <cstdint>
 
 // Scene and camera setup.
-inline constexpr int N_FOR_VIS = 80000;
+inline constexpr int N_FOR_VIS = 150000;
 inline constexpr float DT = 0.2f;
-inline constexpr uint32_t NUM_VIRTUAL_CAMERAS = 40;
+inline constexpr uint32_t NUM_VIRTUAL_CAMERAS = 100;
 // Camera offsets within the interior of the boids' starting regions.
 inline constexpr float VIRTUAL_CAMERA_POSITION_EXTENT = 45.0f;
 inline constexpr uint32_t VIRTUAL_CAMERA_RANDOM_SEED = 5650;
 #ifndef VISUALIZE
-#define VISUALIZE 1
+#define VISUALIZE 0
 #endif
 inline constexpr double NETWORK_UPDATE_INTERVAL_SECONDS = 1.0 / 20.0;
 
@@ -30,7 +30,7 @@ inline constexpr int blockSize = 128;
 #define GRID_SIMULATION 0
 #define GLINT_SIMULATION 1
 #ifndef SIMULATION_TYPE
-#define SIMULATION_TYPE GLINT_SIMULATION
+#define SIMULATION_TYPE GRID_SIMULATION
 #endif
 
 // Culling implementation and visibility predicate are independent choices.
@@ -38,7 +38,7 @@ inline constexpr int blockSize = 128;
 #define GPIC_CULLING 1
 #define GPIC_GLINT_CULLING 2
 #ifndef CULLING_TYPE
-#define CULLING_TYPE GPIC_GLINT_CULLING
+#define CULLING_TYPE GPIC_CULLING
 #endif
 
 #define DIST_VIEW 0
@@ -72,9 +72,9 @@ namespace Boids {
 #define DEBUG_PACKET_LENGTHS 0
 #endif
 #ifndef DEBUG_NETWORK_PIPELINE_TIMINGS
-#define DEBUG_NETWORK_PIPELINE_TIMINGS 1
+#define DEBUG_NETWORK_PIPELINE_TIMINGS 0
 #endif
 // Set to 0 to overlap simulation with packet creation.
 #ifndef DEBUG_PAUSE_SIMULATION_FOR_NETWORK
-#define DEBUG_PAUSE_SIMULATION_FOR_NETWORK 1
+#define DEBUG_PAUSE_SIMULATION_FOR_NETWORK 0
 #endif

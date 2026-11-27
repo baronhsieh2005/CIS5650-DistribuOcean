@@ -62,8 +62,9 @@ public:
 
     struct FilterEntry {
         int pid;
-        GlintNode *node;
+        int node_idx;
     };
+    static_assert(sizeof(FilterEntry) == 8);
 
     struct PartitionBuff {
         uint32_t boid_idx[NUM_BOIDS_PER_PARTITION];
@@ -82,9 +83,9 @@ public:
     uint64_t get_topology_revision() const { return topology_revision; }
 #endif
 
-    void init(int boid_count, const glm::vec3 *device_positions,
+    void init(int boid_count, const glm::vec3 *device_positions, cudaStream_t simulation_stream,
         int depth = GLINT_INITIAL_MAX_DEPTH);
-    void deletion();
+    void deletion(cudaStream_t simulation_stream);
 
     void update_partition(const glm::vec3 *dev_positions, cudaStream_t simulation_stream);
     void update_filter(cudaStream_t simulation_stream);

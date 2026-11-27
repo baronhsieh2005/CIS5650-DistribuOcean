@@ -264,17 +264,17 @@ void Boids::initSimulation(int N) {
 
 #if SIMULATION_TYPE == GLINT_SIMULATION
   cudaStreamSynchronize(simulation_stream);
-  glintOctree.init(N, dev_pos);
-  cudaMalloc((void **)&dev_glintLeaves_snapshot,
-    NODE_STK_MAX_SIZE * sizeof(GlintLeafSnapshot));
-  cudaMalloc((void **)&dev_glintBoidIndices_snapshot, N * sizeof(uint32_t));
-  cudaMalloc((void **)&dev_glintLeafOffsets_snapshot, NODE_STK_MAX_SIZE * sizeof(int));
+  glintOctree.init(N, dev_pos, simulation_stream);
+  cudaMallocAsync((void **)&dev_glintLeaves_snapshot,
+    NODE_STK_MAX_SIZE * sizeof(GlintLeafSnapshot), simulation_stream);
+  cudaMallocAsync((void **)&dev_glintBoidIndices_snapshot, N * sizeof(uint32_t), simulation_stream);
+  cudaMallocAsync((void **)&dev_glintLeafOffsets_snapshot, NODE_STK_MAX_SIZE * sizeof(int), simulation_stream);
   const auto leafData = glintOctree.get_leaf_data();
   auto leafSizes = thrust::make_transform_iterator(thrust::make_counting_iterator(0),
     GetGlintLeafSize{leafData.active_leaves, leafData.nodes});
   cub::DeviceScan::ExclusiveSum(nullptr, glintSnapshotScanTempBytes, leafSizes,
     dev_glintLeafOffsets_snapshot, NODE_STK_MAX_SIZE, simulation_stream);
-  cudaMalloc(&glintSnapshotScanTemp, glintSnapshotScanTempBytes);
+  cudaMallocAsync(&glintSnapshotScanTemp, glintSnapshotScanTempBytes, simulation_stream);
   checkCUDAErrorWithLine("allocate network GLINT snapshot failed!");
 #endif
 
@@ -685,11 +685,11 @@ void releaseNetworkBuffers();
 void Boids::endSimulation() {
   cudaStreamSynchronize(simulation_stream);
 #if SIMULATION_TYPE == GLINT_SIMULATION
-  glintOctree.deletion();
-  cudaFree(dev_glintLeaves_snapshot);
-  cudaFree(dev_glintBoidIndices_snapshot);
-  cudaFree(dev_glintLeafOffsets_snapshot);
-  cudaFree(glintSnapshotScanTemp);
+  glintOctree.deletion(simulation_stream);
+  cudaFreeAsync(dev_glintLeaves_snapshot, simulation_stream);
+  cudaFreeAsync(dev_glintBoidIndices_snapshot, simulation_stream);
+  cudaFreeAsync(dev_glintLeafOffsets_snapshot, simulation_stream);
+  cudaFreeAsync(glintSnapshotScanTemp, simulation_stream);
   dev_glintLeaves_snapshot = nullptr;
   dev_glintBoidIndices_snapshot = nullptr;
   dev_glintLeafOffsets_snapshot = nullptr;

@@ -294,14 +294,29 @@ __device__ void push_to_partition(GlintNode *node, int val, PartitionBuff *part_
     partition->boid_idx[old_size] = val;
 }
 
+// Every lane in participating must call this, including lanes that do not emit.
+__device__ int reserve_tasks(int *counter, bool emit, unsigned int participating) {
+    const unsigned int mask = __ballot_sync(participating, emit);
+    if (mask == 0) return -1;
+    const int lane = threadIdx.x & 31;
+    const int leader = __ffs(mask) - 1;
+    int start = 0;
+    if (lane == leader) start = atomicAdd(counter, __popc(mask));
+    start = __shfl_sync(participating, start, leader);
+    return emit ? start + __popc(mask & ((1u << lane) - 1u)) : -1;
+}
+
 __global__ void partition(int num_boids, const glm::vec3 *points_lst,
     GlintNode *node_lst, PartitionBuff *part_lst,
     FilterEntry *filter_lst, int *filter_lst_size,
     RefinePair *refine_lst, int *refine_lst_size) {
     int pid = threadIdx.x + blockDim.x * blockIdx.x;
+    const unsigned int participating = __ballot_sync(__activemask(), pid < num_boids);
     if (pid >= num_boids) {
         return;
     }
+    // Only filter appends refinement tasks, after this kernel has completed.
+    if (pid == 0) *refine_lst_size = num_boids;
 
     GlintNode *nd = &node_lst[ROOT_NODE_IDX];
     GlintNode *filter_root = &node_lst[ROOT_NODE_IDX];
@@ -317,13 +332,13 @@ __global__ void partition(int num_boids, const glm::vec3 *points_lst,
 
     push_to_partition(nd, pid, part_lst);
     
-    int old_size = atomicAdd(refine_lst_size, 1);
-    refine_lst[old_size] = RefinePair(pid, nd);
-    
-    if (!filter_root->isLeaf() &&
-        getMinDistToNode(position, nd) <= MAX_BOID_INTERACTION_DISTANCE_SQUARED) {
-        old_size = atomicAdd(filter_lst_size, 1);
-        filter_lst[old_size] = FilterEntry(pid, filter_root);
+    refine_lst[pid] = RefinePair(pid, nd);
+
+    const bool needs_filter = !filter_root->isLeaf() &&
+        getMinDistToNode(position, nd) <= MAX_BOID_INTERACTION_DISTANCE_SQUARED;
+    const int rank = reserve_tasks(filter_lst_size, needs_filter, participating);
+    if (needs_filter) {
+        filter_lst[rank] = FilterEntry(pid, static_cast<int>(filter_root - node_lst));
     }
 }
 
@@ -367,30 +382,31 @@ __global__ void filter(int filter_lst_size, const FilterEntry *filter_lst,
         }
         __syncthreads();
 
+        const unsigned int work_mask = __ballot_sync(__activemask(), has_work);
         if (has_work) {
             int pid = entry.pid;
-            GlintNode *nd = entry.node;
+            GlintNode *nd = &node_lst[entry.node_idx];
             const glm::vec3 position = points_lst[pid];
 
             for (int child_idx : nd->child_node_idx) {
                 GlintNode *child = &node_lst[child_idx];
                 const float distance_squared = get_distance(position, child);
-                if (distance_squared <= MAX_BOID_INTERACTION_DISTANCE_SQUARED) {
-                    if (!child->isLeaf()) {
-                        int old_size = atomicAdd(&stackSize, 1);
-                        stack[old_size] = FilterEntry(pid, child);
-                    } else {
-                        const glm::vec3 root_max = node_lst[ROOT_NODE_IDX].max_coords;
-                        const bool own_leaf = distance_squared == 0.0f &&
-                            (position.x < child->max_coords.x || child->max_coords.x == root_max.x) &&
-                            (position.y < child->max_coords.y || child->max_coords.y == root_max.y) &&
-                            (position.z < child->max_coords.z || child->max_coords.z == root_max.z);
-                        if (!own_leaf) {
-                            int old_size = atomicAdd(refine_lst_size, 1);
-                            refine_lst[old_size] = RefinePair(pid, child);
-                        }
-                    }
+                const bool intersects = distance_squared <= MAX_BOID_INTERACTION_DISTANCE_SQUARED;
+                const bool leaf = child->isLeaf();
+                const bool push_child = intersects && !leaf;
+                bool refine_child = false;
+                if (intersects && leaf && child->size > 0) {
+                    const glm::vec3 root_max = node_lst[ROOT_NODE_IDX].max_coords;
+                    const bool own_leaf = distance_squared == 0.0f &&
+                        (position.x < child->max_coords.x || child->max_coords.x == root_max.x) &&
+                        (position.y < child->max_coords.y || child->max_coords.y == root_max.y) &&
+                        (position.z < child->max_coords.z || child->max_coords.z == root_max.z);
+                    refine_child = !own_leaf;
                 }
+                const int stack_rank = reserve_tasks(&stackSize, push_child, work_mask);
+                if (push_child) stack[stack_rank] = FilterEntry(pid, child_idx);
+                const int refine_rank = reserve_tasks(refine_lst_size, refine_child, work_mask);
+                if (refine_child) refine_lst[refine_rank] = RefinePair(pid, child);
             }
         }
         __syncthreads();
@@ -607,7 +623,7 @@ void checkGlintCUDA(cudaError_t result) {
 }
 }
 
-void GlintOctree::init(int boid_count, const glm::vec3 *device_positions, int depth) {
+void GlintOctree::init(int boid_count, const glm::vec3 *device_positions, cudaStream_t simulation_stream, int depth) {
     if (device_positions == nullptr || depth < 0)
         throw std::invalid_argument("GLINT: invalid positions or depth");
     int total = 1, width = 1;
@@ -620,7 +636,7 @@ void GlintOctree::init(int boid_count, const glm::vec3 *device_positions, int de
     if (width > PART_STK_MAX_SIZE)
         throw std::invalid_argument("GLINT: initial leaves exceed partition pool");
 
-    deletion();
+    deletion(simulation_stream);
     points_lst = device_positions;
     num_boids = boid_count;
     max_depth = depth;
@@ -628,9 +644,9 @@ void GlintOctree::init(int boid_count, const glm::vec3 *device_positions, int de
     const int threads = GLINT_THREADS_PER_BLOCK;
     const int node_blocks = (NODE_STK_MAX_SIZE + threads - 1) / threads;
     const int boid_blocks = (num_boids + threads - 1) / threads;
-    auto allocate = [](auto *&pointer, size_t count) {
-        checkGlintCUDA(cudaMalloc(reinterpret_cast<void **>(&pointer),
-            count * sizeof(*pointer)));
+    auto allocate = [simulation_stream](auto *&pointer, size_t count) {
+        checkGlintCUDA(cudaMallocAsync(reinterpret_cast<void **>(&pointer),
+            count * sizeof(*pointer), simulation_stream));
     };
     try {
         allocate(node_lst, NODE_STK_MAX_SIZE);
@@ -646,8 +662,7 @@ void GlintOctree::init(int boid_count, const glm::vec3 *device_positions, int de
         allocate(alignment_count, num_boids);
         allocate(filter_lst_size, 1);
         allocate(refine_lst_size, 1);
-        checkGlintCUDA(cudaMemset(filter_lst_size, 0, sizeof(int)));
-        checkGlintCUDA(cudaMemset(refine_lst_size, 0, sizeof(int)));
+        checkGlintCUDA(cudaMemsetAsync(filter_lst_size, 0, sizeof(int), simulation_stream));
         allocate(node_stk_head, 1);
         allocate(node_stk_tail, 1);
         allocate(part_stk_head, 1);
@@ -669,76 +684,77 @@ void GlintOctree::init(int boid_count, const glm::vec3 *device_positions, int de
         allocate(next_num_active_leaves, 1);
         allocate(next_num_potential_leaf_parents, 1);
         allocate(topology_changed, 1);
-        checkGlintCUDA(cudaMemset(next_num_active_leaves, 0, sizeof(int)));
-        checkGlintCUDA(cudaMemset(next_num_potential_leaf_parents, 0, sizeof(int)));
-        checkGlintCUDA(cudaMemset(topology_changed, 0, sizeof(int)));
+        checkGlintCUDA(cudaMemsetAsync(next_num_active_leaves, 0, sizeof(int), simulation_stream));
+        checkGlintCUDA(cudaMemsetAsync(next_num_potential_leaf_parents, 0, sizeof(int), simulation_stream));
+        checkGlintCUDA(cudaMemsetAsync(topology_changed, 0, sizeof(int), simulation_stream));
 
         auto indices = thrust::make_counting_iterator(0);
         checkGlintCUDA(cub::DeviceSelect::Flagged(nullptr, compact_temp_bytes,
-            indices, active_leaf_map, active_leaves, num_active_leaves, NODE_STK_MAX_SIZE));
+            indices, active_leaf_map, active_leaves, num_active_leaves, NODE_STK_MAX_SIZE, simulation_stream));
         size_t scan_temp_bytes = 0;
         auto output_counts = thrust::make_transform_iterator(indices,
             GetLeafOutputCounts{old_leaf_emit, leaf_parents, leafIsFirstChild});
         checkGlintCUDA(cub::DeviceScan::ExclusiveScan(nullptr, scan_temp_bytes,
             output_counts, old_leaf_offsets, AddLeafOutputCounts{},
-            LeafOutputCounts{0, 0}, NODE_STK_MAX_SIZE));
+            LeafOutputCounts{0, 0}, NODE_STK_MAX_SIZE, simulation_stream));
         if (scan_temp_bytes > compact_temp_bytes) compact_temp_bytes = scan_temp_bytes;
-        checkGlintCUDA(cudaMalloc(&compact_temp, compact_temp_bytes));
+        checkGlintCUDA(cudaMallocAsync(&compact_temp, compact_temp_bytes, simulation_stream));
 
         const int pool_size = NODE_STK_MAX_SIZE > PART_STK_MAX_SIZE
             ? NODE_STK_MAX_SIZE : PART_STK_MAX_SIZE;
-        init_pools<<<(pool_size + threads - 1) / threads, threads>>>(node_lst, node_stk, node_stk_head, node_stk_tail, part_stk, part_stk_head, part_stk_tail, initial_node_count);
+        init_pools<<<(pool_size + threads - 1) / threads, threads, 0, simulation_stream>>>(node_lst, node_stk, node_stk_head, node_stk_tail, part_stk, part_stk_head, part_stk_tail, initial_node_count);
         checkGlintCUDA(cudaGetLastError());
-        build_init_octree<<<(total + threads - 1) / threads, threads>>>(total, depth, node_lst);
+        build_init_octree<<<(total + threads - 1) / threads, threads, 0, simulation_stream>>>(total, depth, node_lst);
         checkGlintCUDA(cudaGetLastError());
-        init_partition<<<boid_blocks, threads>>>(num_boids, points_lst, node_lst);
+        init_partition<<<boid_blocks, threads, 0, simulation_stream>>>(num_boids, points_lst, node_lst);
         checkGlintCUDA(cudaGetLastError());
 
         int level_width = width / 8;
         int level_start = total - width - level_width;
         for (int d = depth - 1; d >= 0; --d) {
-            merge_depth<<<(level_width + threads - 1) / threads, threads>>>(
+            merge_depth<<<(level_width + threads - 1) / threads, threads, 0, simulation_stream>>>(
                 level_start, level_width, node_lst, node_stk, node_stk_head, node_stk_tail, part_stk, part_stk_head, part_stk_tail, false);
             checkGlintCUDA(cudaGetLastError());
             level_width /= 8;
             level_start -= level_width;
         }
-        init_leaves<<<node_blocks, threads>>>(NODE_STK_MAX_SIZE, node_lst, part_stk, part_stk_head, part_stk_tail, active_leaf_map, potential_leaf_parent_map);
+        init_leaves<<<node_blocks, threads, 0, simulation_stream>>>(NODE_STK_MAX_SIZE, node_lst, part_stk, part_stk_head, part_stk_tail, active_leaf_map, potential_leaf_parent_map);
         checkGlintCUDA(cudaGetLastError());
         checkGlintCUDA(cub::DeviceSelect::Flagged(compact_temp, compact_temp_bytes,
-            indices, active_leaf_map, active_leaves, num_active_leaves, NODE_STK_MAX_SIZE));
-        checkGlintCUDA(cudaFree(active_leaf_map));
+            indices, active_leaf_map, active_leaves, num_active_leaves, NODE_STK_MAX_SIZE, simulation_stream));
+        checkGlintCUDA(cudaFreeAsync(active_leaf_map, simulation_stream));
         active_leaf_map = nullptr;
         checkGlintCUDA(cub::DeviceSelect::Flagged(compact_temp, compact_temp_bytes,
             indices, potential_leaf_parent_map, potential_leaf_parents,
-            num_potential_leaf_parents, NODE_STK_MAX_SIZE));
-        checkGlintCUDA(cudaMemcpy(&host_num_active_leaves, num_active_leaves,
-            sizeof(host_num_active_leaves), cudaMemcpyDeviceToHost));
-        checkGlintCUDA(cudaMemcpy(&host_num_potential_leaf_parents, num_potential_leaf_parents,
-            sizeof(host_num_potential_leaf_parents), cudaMemcpyDeviceToHost));
-        init_leaf_first_child<<<(host_num_active_leaves + threads - 1) / threads, threads>>>(
+            num_potential_leaf_parents, NODE_STK_MAX_SIZE, simulation_stream));
+        checkGlintCUDA(cudaMemcpyAsync(&host_num_active_leaves, num_active_leaves,
+            sizeof(host_num_active_leaves), cudaMemcpyDeviceToHost, simulation_stream));
+        checkGlintCUDA(cudaMemcpyAsync(&host_num_potential_leaf_parents, num_potential_leaf_parents,
+            sizeof(host_num_potential_leaf_parents), cudaMemcpyDeviceToHost, simulation_stream));
+        checkGlintCUDA(cudaStreamSynchronize(simulation_stream));
+        init_leaf_first_child<<<(host_num_active_leaves + threads - 1) / threads, threads, 0, simulation_stream>>>(
             host_num_active_leaves, active_leaves, node_lst, leafIsFirstChild, leaf_parents);
         checkGlintCUDA(cudaGetLastError());
-        partition<<<boid_blocks, threads>>>(num_boids, points_lst, node_lst, part_lst,
+        partition<<<boid_blocks, threads, 0, simulation_stream>>>(num_boids, points_lst, node_lst, part_lst,
             filter_lst, filter_lst_size, refine_lst, refine_lst_size);
         checkGlintCUDA(cudaGetLastError());
-        checkGlintCUDA(cudaMemcpy(&host_filter_lst_size, filter_lst_size,
-            sizeof(host_filter_lst_size), cudaMemcpyDeviceToHost));
-        checkGlintCUDA(cudaMemcpy(&host_refine_lst_size, refine_lst_size,
-            sizeof(host_refine_lst_size), cudaMemcpyDeviceToHost));
-        checkGlintCUDA(cudaDeviceSynchronize());
+        checkGlintCUDA(cudaMemcpyAsync(&host_filter_lst_size, filter_lst_size,
+            sizeof(host_filter_lst_size), cudaMemcpyDeviceToHost, simulation_stream));
+        checkGlintCUDA(cudaMemcpyAsync(&host_refine_lst_size, refine_lst_size,
+            sizeof(host_refine_lst_size), cudaMemcpyDeviceToHost, simulation_stream));
+        checkGlintCUDA(cudaStreamSynchronize(simulation_stream));
 #if VISUALIZE
         ++topology_revision;
 #endif
     } catch (...) {
-        deletion();
+        deletion(simulation_stream);
         throw;
     }
 }
 
-void GlintOctree::deletion() {
-    auto release = [](auto *&pointer) {
-        if (pointer) cudaFree(pointer);
+void GlintOctree::deletion(cudaStream_t simulation_stream) {
+    auto release = [simulation_stream](auto *&pointer) {
+        if (pointer) cudaFreeAsync(pointer, simulation_stream);
         pointer = nullptr;
     };
     points_lst = nullptr;
@@ -777,6 +793,7 @@ void GlintOctree::deletion() {
     release(next_num_potential_leaf_parents);
     release(topology_changed);
     release(compact_temp);
+    cudaStreamSynchronize(simulation_stream);
     compact_temp_bytes = 0;
     num_boids = max_depth = initial_node_count = 0;
     host_num_active_leaves = host_num_potential_leaf_parents = 0;
@@ -792,8 +809,7 @@ void GlintOctree::update_partition(const glm::vec3 *dev_positions, cudaStream_t 
     reset_leaf_count<<<leaf_blocks, threads, 0, simulation_stream>>>(host_num_active_leaves, active_leaves, node_lst);
     checkGlintCUDA(cudaGetLastError());
 
-    checkGlintCUDA(cudaMemset(filter_lst_size, 0, sizeof(int)));
-    checkGlintCUDA(cudaMemset(refine_lst_size, 0, sizeof(int)));
+    checkGlintCUDA(cudaMemsetAsync(filter_lst_size, 0, sizeof(int), simulation_stream));
     partition<<<(num_boids + threads - 1) / threads, threads, 0, simulation_stream>>>(num_boids,
         points_lst, node_lst, part_lst, filter_lst, filter_lst_size, refine_lst, refine_lst_size);
     checkGlintCUDA(cudaGetLastError());
@@ -801,8 +817,9 @@ void GlintOctree::update_partition(const glm::vec3 *dev_positions, cudaStream_t 
 
 void GlintOctree::update_filter(cudaStream_t simulation_stream) {
     const int threads = GLINT_THREADS_PER_BLOCK;
-    checkGlintCUDA(cudaMemcpy(&host_filter_lst_size, filter_lst_size,
-        sizeof(host_filter_lst_size), cudaMemcpyDeviceToHost));
+    checkGlintCUDA(cudaMemcpyAsync(&host_filter_lst_size, filter_lst_size,
+        sizeof(host_filter_lst_size), cudaMemcpyDeviceToHost, simulation_stream));
+    checkGlintCUDA(cudaStreamSynchronize(simulation_stream));
     if (host_filter_lst_size > 0) {
         const int filter_blocks = (host_filter_lst_size + threads - 1) / threads;
         const size_t shared_bytes = GLINT_FILTER_STACK_CAPACITY * sizeof(FilterEntry);
@@ -810,8 +827,9 @@ void GlintOctree::update_filter(cudaStream_t simulation_stream) {
             filter_lst, points_lst, node_lst, refine_lst, refine_lst_size);
         checkGlintCUDA(cudaGetLastError());
     }
-    checkGlintCUDA(cudaMemcpy(&host_refine_lst_size, refine_lst_size,
-        sizeof(host_refine_lst_size), cudaMemcpyDeviceToHost));
+    checkGlintCUDA(cudaMemcpyAsync(&host_refine_lst_size, refine_lst_size,
+        sizeof(host_refine_lst_size), cudaMemcpyDeviceToHost, simulation_stream));
+    checkGlintCUDA(cudaStreamSynchronize(simulation_stream));
 }
 
 void GlintOctree::update_velocity(const glm::vec3 *dev_vel1, glm::vec3 *dev_vel2, cudaStream_t simulation_stream) {
@@ -836,7 +854,7 @@ void GlintOctree::update_tree(cudaStream_t simulation_stream) {
     const int threads = GLINT_THREADS_PER_BLOCK;
     const int leaf_blocks = (host_num_active_leaves + threads - 1) / threads;
     const int parent_blocks = (host_num_potential_leaf_parents + threads - 1) / threads;
-    checkGlintCUDA(cudaMemset(topology_changed, 0, sizeof(int)));
+    checkGlintCUDA(cudaMemsetAsync(topology_changed, 0, sizeof(int), simulation_stream));
     split_node<<<leaf_blocks, threads, 0, simulation_stream>>>(host_num_active_leaves, active_leaves, node_lst, node_stk, node_stk_head, node_stk_tail, part_stk, part_stk_head, part_stk_tail, topology_changed, old_leaf_emit);
     checkGlintCUDA(cudaGetLastError());
     if (host_num_potential_leaf_parents > 0) {
@@ -844,8 +862,9 @@ void GlintOctree::update_tree(cudaStream_t simulation_stream) {
         checkGlintCUDA(cudaGetLastError());
     }
 
-    checkGlintCUDA(cudaMemcpy(&host_topology_changed, topology_changed,
-        sizeof(host_topology_changed), cudaMemcpyDeviceToHost));
+    checkGlintCUDA(cudaMemcpyAsync(&host_topology_changed, topology_changed,
+        sizeof(host_topology_changed), cudaMemcpyDeviceToHost, simulation_stream));
+    checkGlintCUDA(cudaStreamSynchronize(simulation_stream));
     if (!host_topology_changed) return;
 
     update_leaf_merge_events<<<leaf_blocks, threads, 0, simulation_stream>>>(host_num_active_leaves,
@@ -864,10 +883,11 @@ void GlintOctree::update_tree(cudaStream_t simulation_stream) {
         next_potential_leaf_parents, next_num_potential_leaf_parents);
     checkGlintCUDA(cudaGetLastError());
 
-    checkGlintCUDA(cudaMemcpy(&host_num_active_leaves, next_num_active_leaves,
-        sizeof(host_num_active_leaves), cudaMemcpyDeviceToHost));
-    checkGlintCUDA(cudaMemcpy(&host_num_potential_leaf_parents, next_num_potential_leaf_parents,
-        sizeof(host_num_potential_leaf_parents), cudaMemcpyDeviceToHost));
+    checkGlintCUDA(cudaMemcpyAsync(&host_num_active_leaves, next_num_active_leaves,
+        sizeof(host_num_active_leaves), cudaMemcpyDeviceToHost, simulation_stream));
+    checkGlintCUDA(cudaMemcpyAsync(&host_num_potential_leaf_parents, next_num_potential_leaf_parents,
+        sizeof(host_num_potential_leaf_parents), cudaMemcpyDeviceToHost, simulation_stream));
+    checkGlintCUDA(cudaStreamSynchronize(simulation_stream));
     std::swap(active_leaves, next_active_leaves);
     std::swap(leaf_parents, next_leaf_parents);
     std::swap(leafIsFirstChild, next_leafIsFirstChild);
