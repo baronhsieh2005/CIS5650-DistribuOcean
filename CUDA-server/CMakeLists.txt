@@ -52,6 +52,7 @@ find_package(CCCL REQUIRED)
 
 set(headers
     src/config.h
+    src/packet_creation/glint.h
     src/packet_creation/compact.cuh
     src/packet_creation/culling.h
     src/cudaMat4.hpp
@@ -62,6 +63,7 @@ set(headers
     )
 
 set(sources
+    src/packet_creation/glint.cu
     src/packet_creation/compact.cu
     src/packet_creation/culling.cu
     src/glslUtility.cpp

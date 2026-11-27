@@ -32,7 +32,7 @@ inline constexpr int blockSize = 128;
 #define NAIVE_CULLING 0
 #define GPIC_CULLING 1
 #ifndef CULLING_TYPE
-#define CULLING_TYPE GPIC_CULLING
+#define CULLING_TYPE NAIVE_CULLING
 #endif
 
 #define DIST_VIEW 0
