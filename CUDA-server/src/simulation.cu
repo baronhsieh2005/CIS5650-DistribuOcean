@@ -645,6 +645,7 @@ void Boids::stepSimulationGlint(float dt, CameraCullData *cameras, bool *cameraC
     checkCUDAErrorWithLine("kernUpdatePos failed!");
   
     cudaStreamSynchronize(simulation_stream);
+    glintOctree.finish_update_tree();
 #if DEBUG_GLINT_PIPELINE_TIMINGS || DEBUG_GLINT_TREE_UPDATES
     glintOctree.finish_debug_step();
 #endif

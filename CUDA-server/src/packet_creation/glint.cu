@@ -766,6 +766,8 @@ void GlintOctree::init(int boid_count, const glm::vec3 *device_positions, cudaSt
             count * sizeof(*pointer), simulation_stream));
     };
     try {
+        checkGlintCUDA(cudaMallocHost(reinterpret_cast<void **>(&host_leaf_counts),
+            sizeof(*host_leaf_counts)));
 #if DEBUG_GLINT_PIPELINE_TIMINGS
         for (int i = 0; i < GLINT_TIMING_COUNT; ++i) {
             checkGlintCUDA(cudaEventCreate(&timing_start[i]));
@@ -932,6 +934,9 @@ void GlintOctree::deletion(cudaStream_t simulation_stream) {
     release(topology_changed);
     release(compact_temp);
     cudaStreamSynchronize(simulation_stream);
+    if (host_leaf_counts) cudaFreeHost(host_leaf_counts);
+    host_leaf_counts = nullptr;
+    leaf_counts_pending = false;
 #if DEBUG_GLINT_PIPELINE_TIMINGS
     for (int i = 0; i < GLINT_TIMING_COUNT; ++i) {
         if (timing_start[i]) cudaEventDestroy(timing_start[i]);
@@ -1096,12 +1101,12 @@ void GlintOctree::update_tree(cudaStream_t simulation_stream) {
     checkGlintCUDA(cudaGetLastError());
 
     GLINT_TIME_BEGIN(LEAF_COUNTS);
-    checkGlintCUDA(cudaMemcpyAsync(&host_num_active_leaves, next_num_active_leaves,
+    checkGlintCUDA(cudaMemcpyAsync(&host_leaf_counts->leaves, next_num_active_leaves,
         sizeof(host_num_active_leaves), cudaMemcpyDeviceToHost, simulation_stream));
-    checkGlintCUDA(cudaMemcpyAsync(&host_num_potential_leaf_parents, next_num_potential_leaf_parents,
+    checkGlintCUDA(cudaMemcpyAsync(&host_leaf_counts->parents, next_num_potential_leaf_parents,
         sizeof(host_num_potential_leaf_parents), cudaMemcpyDeviceToHost, simulation_stream));
     GLINT_TIME_END(LEAF_COUNTS);
-    checkGlintCUDA(cudaStreamSynchronize(simulation_stream));
+    leaf_counts_pending = true;
     std::swap(active_leaves, next_active_leaves);
     std::swap(leaf_parents, next_leaf_parents);
     std::swap(leafIsFirstChild, next_leafIsFirstChild);
@@ -1111,6 +1116,13 @@ void GlintOctree::update_tree(cudaStream_t simulation_stream) {
 #if VISUALIZE
     ++topology_revision;
 #endif
+}
+
+void GlintOctree::finish_update_tree() {
+    if (!leaf_counts_pending) return;
+    host_num_active_leaves = host_leaf_counts->leaves;
+    host_num_potential_leaf_parents = host_leaf_counts->parents;
+    leaf_counts_pending = false;
 }
 
 #if DEBUG_GLINT_PIPELINE_TIMINGS || DEBUG_GLINT_TREE_UPDATES

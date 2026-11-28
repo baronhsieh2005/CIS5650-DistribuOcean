@@ -72,7 +72,7 @@ namespace Boids {
 
 // Debug switches can also be overridden through compiler definitions.
 #ifndef DEBUG_MODE
-#define DEBUG_MODE 0
+#define DEBUG_MODE 1
 #endif
 #ifndef DEBUG_PACKET_LENGTHS
 #define DEBUG_PACKET_LENGTHS 0

@@ -91,6 +91,8 @@ public:
     void update_filter(cudaStream_t simulation_stream);
     void update_velocity(const glm::vec3 *dev_vel1, glm::vec3 *dev_vel2, cudaStream_t simulation_stream);
     void update_tree(cudaStream_t simulation_stream);
+    // Consume deferred leaf counts after the existing end-of-step stream synchronization.
+    void finish_update_tree();
 #if DEBUG_GLINT_PIPELINE_TIMINGS || DEBUG_GLINT_TREE_UPDATES
     void begin_debug_step();
     // Called after the simulation's existing end-of-step stream synchronization.
@@ -178,6 +180,8 @@ private:
     int host_topology_changed = 0;
     int host_num_active_leaves = 0;
     int host_num_potential_leaf_parents = 0;
+    LeafOutputCounts *host_leaf_counts = nullptr;
+    bool leaf_counts_pending = false;
     void *compact_temp = nullptr;
     size_t compact_temp_bytes = 0;
     int num_boids = 0;
