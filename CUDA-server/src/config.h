@@ -10,7 +10,7 @@ inline constexpr uint32_t NUM_VIRTUAL_CAMERAS = 100;
 inline constexpr float VIRTUAL_CAMERA_POSITION_EXTENT = 45.0f;
 inline constexpr uint32_t VIRTUAL_CAMERA_RANDOM_SEED = 5650;
 #ifndef VISUALIZE
-#define VISUALIZE 1
+#define VISUALIZE 0
 #endif
 inline constexpr double NETWORK_UPDATE_INTERVAL_SECONDS = 1.0 / 20.0;
 
@@ -25,6 +25,12 @@ inline constexpr int blockSize = 128;
 #define rule3Scale 0.1f
 #define maxSpeed 3.0f
 #define scene_scale 300.0f
+// Splitting must not create GLINT cells smaller than this width.
+#define GLINT_MIN_CELL_SIZE 4.0f
+// Prototype: group refinement tasks by candidate leaf and reuse shared positions.
+#ifndef GLINT_COOPERATIVE_REFINEMENT
+#define GLINT_COOPERATIVE_REFINEMENT 1
+#endif
 #define spawnFlockRadius 90.0f
 
 #define GRID_SIMULATION 0
@@ -38,7 +44,7 @@ inline constexpr int blockSize = 128;
 #define GPIC_CULLING 1
 #define GPIC_GLINT_CULLING 2
 #ifndef CULLING_TYPE
-#define CULLING_TYPE GPIC_CULLING
+#define CULLING_TYPE GPIC_GLINT_CULLING
 #endif
 
 #define DIST_VIEW 0
@@ -76,7 +82,7 @@ namespace Boids {
 #endif
 // Average individual GLINT operations over each simulation-rate report interval.
 #ifndef DEBUG_GLINT_PIPELINE_TIMINGS
-#define DEBUG_GLINT_PIPELINE_TIMINGS 0
+#define DEBUG_GLINT_PIPELINE_TIMINGS 1
 #endif
 // Can be enabled independently without creating timing events.
 #ifndef DEBUG_GLINT_TREE_UPDATES

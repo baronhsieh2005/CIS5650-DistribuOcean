@@ -495,6 +495,108 @@ __global__ void refinement(int num_pairs, const RefinePair *refine_lst,
     }
 }
 
+#if GLINT_COOPERATIVE_REFINEMENT
+__global__ void count_refinement_tasks(int num_pairs, const RefinePair *refine_lst,
+    int *refine_leaf_counts) {
+    const int pair_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (pair_idx >= num_pairs) {
+        return;
+    }
+    atomicAdd(&refine_leaf_counts[refine_lst[pair_idx].node->part_idx], 1);
+}
+
+__global__ void scatter_refinement_tasks(int num_pairs, const RefinePair *refine_lst,
+    const int *refine_leaf_offsets, int *refine_leaf_counts, int *refine_grouped_pids) {
+    const int pair_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (pair_idx >= num_pairs) {
+        return;
+    }
+    const RefinePair pair = refine_lst[pair_idx];
+    const int part_idx = pair.node->part_idx;
+    const int rank = atomicAdd(&refine_leaf_counts[part_idx], 1);
+    refine_grouped_pids[refine_leaf_offsets[part_idx] + rank] = pair.pid;
+}
+
+__global__ void refinement_cooperative(int num_leaves, const int *active_leaves,
+    const GlintNode *node_lst, const PartitionBuff *part_lst,
+    const int *refine_leaf_counts, const int *refine_leaf_offsets,
+    const int *refine_grouped_pids, const glm::vec3 *points_lst,
+    const glm::vec3 *vel1, glm::vec3 *position_sum, glm::vec3 *separation_sum,
+    glm::vec3 *velocity_sum, int *cohesion_count, int *alignment_count) {
+    const int leaf_idx = blockIdx.x;
+    if (leaf_idx >= num_leaves) return;
+    const GlintNode *node = &node_lst[active_leaves[leaf_idx]];
+    const int size = node->size;
+    const int part_idx = node->part_idx;
+    const int count = refine_leaf_counts[part_idx];
+    if (size == 0 || count == 0) return;
+
+    __shared__ uint32_t shared_ids[NUM_BOIDS_PER_PARTITION];
+    __shared__ float shared_x[NUM_BOIDS_PER_PARTITION];
+    __shared__ float shared_y[NUM_BOIDS_PER_PARTITION];
+    __shared__ float shared_z[NUM_BOIDS_PER_PARTITION];
+    const PartitionBuff *partition = &part_lst[part_idx];
+    for (int i = threadIdx.x; i < size; i += blockDim.x) {
+        const uint32_t pid = partition->boid_idx[i];
+        const glm::vec3 position = points_lst[pid];
+        shared_ids[i] = pid;
+        shared_x[i] = position.x;
+        shared_y[i] = position.y;
+        shared_z[i] = position.z;
+    }
+    __syncthreads();
+
+    const int start = refine_leaf_offsets[part_idx];
+    // Read-only shared data needs no additional barriers between target chunks.
+    for (int target = threadIdx.x; target < count; target += blockDim.x) {
+        const uint32_t pid1 = refine_grouped_pids[start + target];
+        const glm::vec3 position = points_lst[pid1];
+        glm::vec3 local_position_sum(0.0f);
+        glm::vec3 local_separation_sum(0.0f);
+        glm::vec3 local_velocity_sum(0.0f);
+        int local_cohesion_count = 0;
+        int local_alignment_count = 0;
+        bool has_separation = false;
+        for (int i = 0; i < size; ++i) {
+            const uint32_t pid2 = shared_ids[i];
+            if (pid2 == pid1) continue;
+            const glm::vec3 neighbor_position = glm::vec3(shared_x[i], shared_y[i], shared_z[i]);
+            const glm::vec3 delta = neighbor_position - position;
+            const float distance_squared = glm::dot(delta, delta);
+            if (distance_squared < rule1Distance * rule1Distance) {
+                local_position_sum += neighbor_position;
+                ++local_cohesion_count;
+            }
+            if (distance_squared < rule2Distance * rule2Distance) {
+                local_separation_sum -= delta;
+                has_separation = true;
+            }
+            if (distance_squared < rule3Distance * rule3Distance) {
+                local_velocity_sum += vel1[pid2];
+                ++local_alignment_count;
+            }
+        }
+        if (local_cohesion_count) {
+            atomicAdd(&position_sum[pid1].x, local_position_sum.x);
+            atomicAdd(&position_sum[pid1].y, local_position_sum.y);
+            atomicAdd(&position_sum[pid1].z, local_position_sum.z);
+            atomicAdd(&cohesion_count[pid1], local_cohesion_count);
+        }
+        if (has_separation) {
+            atomicAdd(&separation_sum[pid1].x, local_separation_sum.x);
+            atomicAdd(&separation_sum[pid1].y, local_separation_sum.y);
+            atomicAdd(&separation_sum[pid1].z, local_separation_sum.z);
+        }
+        if (local_alignment_count) {
+            atomicAdd(&velocity_sum[pid1].x, local_velocity_sum.x);
+            atomicAdd(&velocity_sum[pid1].y, local_velocity_sum.y);
+            atomicAdd(&velocity_sum[pid1].z, local_velocity_sum.z);
+            atomicAdd(&alignment_count[pid1], local_alignment_count);
+        }
+    }
+}
+#endif
+
 __global__ void finalize_velocity(int num_boids, const glm::vec3 *points_lst,
     const glm::vec3 *vel1, glm::vec3 *vel2, const glm::vec3 *position_sum,
     const glm::vec3 *separation_sum, const glm::vec3 *velocity_sum,
@@ -520,7 +622,10 @@ __global__ void split_node(int num_active_leaves, int *active_leaves, GlintNode 
     }
 
     GlintNode *node = &node_lst[active_leaves[leaf_idx]];
-    if (node->isLeaf() && node->size > PARTITION_GRANULARITY_SPLIT) {
+    const glm::vec3 child_size = (node->max_coords - node->min_coords) * 0.5f;
+    if (node->isLeaf() && node->size > PARTITION_GRANULARITY_SPLIT &&
+        child_size.x >= GLINT_MIN_CELL_SIZE && child_size.y >= GLINT_MIN_CELL_SIZE &&
+        child_size.z >= GLINT_MIN_CELL_SIZE) {
         const glm::vec3 midpoint = node->min_coords +
             (node->max_coords - node->min_coords) * 0.5f;
         for (int i = 0; i < 8; i++) {
@@ -673,6 +778,14 @@ void GlintOctree::init(int boid_count, const glm::vec3 *device_positions, cudaSt
         allocate(part_stk, PART_STK_MAX_SIZE);
         allocate(filter_lst, static_cast<size_t>(num_boids));
         allocate(refine_lst, static_cast<size_t>(num_boids) * GLINT_REFINE_PAIRS_PER_BOID);
+#if GLINT_COOPERATIVE_REFINEMENT
+        allocate(refine_leaf_counts, PART_STK_MAX_SIZE);
+        allocate(refine_leaf_offsets, PART_STK_MAX_SIZE);
+        allocate(refine_grouped_pids, static_cast<size_t>(num_boids) * GLINT_REFINE_PAIRS_PER_BOID);
+        checkGlintCUDA(cub::DeviceScan::ExclusiveSum(nullptr, refine_group_temp_bytes,
+            refine_leaf_counts, refine_leaf_offsets, PART_STK_MAX_SIZE, simulation_stream));
+        checkGlintCUDA(cudaMallocAsync(&refine_group_temp, refine_group_temp_bytes, simulation_stream));
+#endif
         allocate(position_sum, num_boids);
         allocate(separation_sum, num_boids);
         allocate(velocity_sum, num_boids);
@@ -782,6 +895,13 @@ void GlintOctree::deletion(cudaStream_t simulation_stream) {
     release(part_stk);
     release(filter_lst);
     release(refine_lst);
+#if GLINT_COOPERATIVE_REFINEMENT
+    release(refine_leaf_counts);
+    release(refine_leaf_offsets);
+    release(refine_grouped_pids);
+    release(refine_group_temp);
+    refine_group_temp_bytes = 0;
+#endif
     release(position_sum);
     release(separation_sum);
     release(velocity_sum);
@@ -885,10 +1005,39 @@ void GlintOctree::update_velocity(const glm::vec3 *dev_vel1, glm::vec3 *dev_vel2
     checkGlintCUDA(cudaGetLastError());
     if (host_refine_lst_size > 0) {
         const int refinement_blocks = (host_refine_lst_size + threads - 1) / threads;
+#if GLINT_COOPERATIVE_REFINEMENT
+        GLINT_TIME_BEGIN(REFINE_GROUP_COUNT);
+        checkGlintCUDA(cudaMemsetAsync(refine_leaf_counts, 0,
+            PART_STK_MAX_SIZE * sizeof(int), simulation_stream));
+        count_refinement_tasks<<<refinement_blocks, threads, 0, simulation_stream>>>(
+            host_refine_lst_size, refine_lst, refine_leaf_counts);
+        GLINT_TIME_END(REFINE_GROUP_COUNT);
+        checkGlintCUDA(cudaGetLastError());
+
+        GLINT_TIME_BEGIN(REFINE_GROUP_SCAN);
+        checkGlintCUDA(cub::DeviceScan::ExclusiveSum(refine_group_temp, refine_group_temp_bytes,
+            refine_leaf_counts, refine_leaf_offsets, PART_STK_MAX_SIZE, simulation_stream));
+        GLINT_TIME_END(REFINE_GROUP_SCAN);
+
+        GLINT_TIME_BEGIN(REFINE_GROUP_SCATTER);
+        checkGlintCUDA(cudaMemsetAsync(refine_leaf_counts, 0,
+            PART_STK_MAX_SIZE * sizeof(int), simulation_stream));
+        scatter_refinement_tasks<<<refinement_blocks, threads, 0, simulation_stream>>>(
+            host_refine_lst_size, refine_lst, refine_leaf_offsets, refine_leaf_counts, refine_grouped_pids);
+        GLINT_TIME_END(REFINE_GROUP_SCATTER);
+        checkGlintCUDA(cudaGetLastError());
+
+        GLINT_TIME_BEGIN(REFINEMENT);
+        refinement_cooperative<<<host_num_active_leaves, threads, 0, simulation_stream>>>(
+            host_num_active_leaves, active_leaves, node_lst, part_lst,
+            refine_leaf_counts, refine_leaf_offsets, refine_grouped_pids, points_lst, dev_vel1,
+            position_sum, separation_sum, velocity_sum, cohesion_count, alignment_count);
+#else
         GLINT_TIME_BEGIN(REFINEMENT);
         refinement<<<refinement_blocks, threads, 0, simulation_stream>>>(host_refine_lst_size,
             refine_lst, points_lst, part_lst, dev_vel1,
             position_sum, separation_sum, velocity_sum, cohesion_count, alignment_count);
+#endif
         GLINT_TIME_END(REFINEMENT);
         checkGlintCUDA(cudaGetLastError());
     }
@@ -996,7 +1145,7 @@ void GlintOctree::print_debug_stats() {
 #if DEBUG_GLINT_PIPELINE_TIMINGS
     static constexpr const char *names[] = {
         "leaf_reset", "filter_reset", "partition", "filter_count", "filter", "refine_count",
-        "accum_reset", "refinement", "finalize", "flag_reset", "split", "merge", "flag_read",
+        "accum_reset", "refine_group_count", "refine_group_scan", "refine_group_scatter", "refinement", "finalize", "flag_reset", "split", "merge", "flag_read",
         "merge_events", "scan", "scatter", "leaf_counts", "move",
         "copy", "scan", "leaves"
     };

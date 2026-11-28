@@ -101,7 +101,9 @@ public:
     enum TimingStage {
         GLINT_TIMING_LEAF_RESET, GLINT_TIMING_FILTER_RESET, GLINT_TIMING_PARTITION,
         GLINT_TIMING_FILTER_COUNT, GLINT_TIMING_FILTER, GLINT_TIMING_REFINE_COUNT,
-        GLINT_TIMING_ACCUM_RESET, GLINT_TIMING_REFINEMENT, GLINT_TIMING_FINALIZE,
+        GLINT_TIMING_ACCUM_RESET, GLINT_TIMING_REFINE_GROUP_COUNT,
+        GLINT_TIMING_REFINE_GROUP_SCAN, GLINT_TIMING_REFINE_GROUP_SCATTER,
+        GLINT_TIMING_REFINEMENT, GLINT_TIMING_FINALIZE,
         GLINT_TIMING_TREE_RESET, GLINT_TIMING_SPLIT, GLINT_TIMING_MERGE,
         GLINT_TIMING_TREE_FLAG, GLINT_TIMING_MERGE_EVENTS, GLINT_TIMING_SCAN,
         GLINT_TIMING_SCATTER, GLINT_TIMING_LEAF_COUNTS, GLINT_TIMING_MOVE,
@@ -135,6 +137,13 @@ private:
     int *part_stk = nullptr;
     FilterEntry *filter_lst = nullptr;
     RefinePair *refine_lst = nullptr;
+#if GLINT_COOPERATIVE_REFINEMENT
+    int *refine_leaf_counts = nullptr;
+    int *refine_leaf_offsets = nullptr;
+    int *refine_grouped_pids = nullptr;
+    void *refine_group_temp = nullptr;
+    size_t refine_group_temp_bytes = 0;
+#endif
     int *filter_lst_size = nullptr;
     int *refine_lst_size = nullptr;
     int host_filter_lst_size = 0;
